@@ -121,7 +121,7 @@ func TestProxyHandlerLoadConfig(t *testing.T) {
 		wantBody   string
 		skip       bool
 	}{
-		{"api endpoint", "/api", http.StatusBadGateway, "", true},  // Skip as api.example.com doesn't exist
+		{"api endpoint", "/api", http.StatusBadGateway, "", true}, // Skip as api.example.com doesn't exist
 		{"static file", "/static/index.html", http.StatusOK, "<html>test</html>", false},
 		{"static txt file", "/static/test.txt", http.StatusOK, "static test content", false},
 		{"static directory", "/static/", http.StatusOK, "", false}, // Directory listing
@@ -178,7 +178,7 @@ func TestModifyResponse(t *testing.T) {
 		Header: make(http.Header),
 		Body:   ioutil.NopCloser(bytes.NewBufferString("test body")),
 	}
-	
+
 	if err := modifyResponse(resp); err != nil {
 		t.Errorf("modifyResponse() error = %v", err)
 	}
