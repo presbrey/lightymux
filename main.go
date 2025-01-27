@@ -100,7 +100,7 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 func (lm *LightyMux) newReverseProxy(nextHop *url.URL) *httputil.ReverseProxy {
 	transport := &http.Transport{
 		ResponseHeaderTimeout: lm.options.ProxyTimeout,
-		MaxIdleConnsPerHost:  100,
+		MaxIdleConnsPerHost:   100,
 	}
 
 	rp := &httputil.ReverseProxy{
