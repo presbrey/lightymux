@@ -53,37 +53,42 @@ func TestSingleJoiningSlash(t *testing.T) {
 	}
 }
 
-func TestProxyHandlerLoadConfig(t *testing.T) {
-	// Create a temporary config file
+type testFile struct {
+	path    string
+	content string
+}
+
+func setupTestFiles(t *testing.T) (string, []testFile, func()) {
 	tmpdir, err := ioutil.TempDir("", "static")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(tmpdir)
 
-	// Create static directory with test files
 	staticDir := filepath.Join(tmpdir, "static")
 	if err := os.MkdirAll(staticDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create test files in the static directory
-	staticFiles := map[string]string{
-		"index.html": "<html>test</html>",
-		"test.txt":   "static test content",
+	files := []testFile{
+		{filepath.Join(staticDir, "index.html"), "<html>test</html>"},
+		{filepath.Join(staticDir, "test.txt"), "static test content"},
+		{filepath.Join(tmpdir, "test.txt"), "single file test content"},
 	}
-	for name, content := range staticFiles {
-		if err := ioutil.WriteFile(filepath.Join(staticDir, name), []byte(content), 0644); err != nil {
+
+	for _, f := range files {
+		if err := ioutil.WriteFile(f.path, []byte(f.content), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	// Create a separate test file
-	testFile := filepath.Join(tmpdir, "test.txt")
-	if err := ioutil.WriteFile(testFile, []byte("single file test content"), 0644); err != nil {
-		t.Fatal(err)
+	cleanup := func() {
+		os.RemoveAll(tmpdir)
 	}
 
+	return staticDir, files, cleanup
+}
+
+func createConfigFile(t *testing.T, staticDir, testFile string) (string, func()) {
 	content := fmt.Sprintf(`/api http://api.example.com
 /static/ %s
 /file %s
@@ -93,7 +98,6 @@ func TestProxyHandlerLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmpfile.Name())
 
 	if _, err := tmpfile.Write([]byte(content)); err != nil {
 		t.Fatal(err)
@@ -102,34 +106,23 @@ func TestProxyHandlerLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Initialize proxy handler
-	ph := &ProxyHandler{
-		mux: http.NewServeMux(),
-	}
-	logger = log.New(ioutil.Discard, "", 0) // Suppress logging during tests
-
-	// Test loading config
-	if err := ph.loadConfig(tmpfile.Name()); err != nil {
-		t.Fatalf("loadConfig() error = %v", err)
+	cleanup := func() {
+		os.Remove(tmpfile.Name())
 	}
 
-	// Test proxy routes
-	tests := []struct {
-		name       string
-		path       string
-		wantStatus int
-		wantBody   string
-		skip       bool
-	}{
-		{"api endpoint", "/api", http.StatusBadGateway, "", true}, // Skip as api.example.com doesn't exist
-		{"static file", "/static/index.html", http.StatusOK, "<html>test</html>", false},
-		{"static txt file", "/static/test.txt", http.StatusOK, "static test content", false},
-		{"static directory", "/static/", http.StatusOK, "", false}, // Directory listing
-		{"single file", "/file", http.StatusOK, "single file test content", false},
-	}
+	return tmpfile.Name(), cleanup
+}
 
-	server := httptest.NewServer(ph)
-	defer server.Close()
+func runProxyTest(t *testing.T, server *httptest.Server, tt struct {
+	name       string
+	path       string
+	wantStatus int
+	wantBody   string
+	skip       bool
+}) {
+	if tt.skip {
+		return
+	}
 
 	baseURL, err := url.Parse(server.URL)
 	if err != nil {
@@ -138,37 +131,70 @@ func TestProxyHandlerLoadConfig(t *testing.T) {
 
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil // Follow redirects
+			return nil
 		},
 	}
 
-	for _, tt := range tests {
-		if tt.skip {
-			continue
+	reqURL := baseURL.ResolveReference(&url.URL{Path: tt.path})
+	resp, err := client.Get(reqURL.String())
+	if err != nil {
+		t.Fatalf("client.Get(%q) failed: %v", reqURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != tt.wantStatus {
+		t.Errorf("path %q: got status = %d, want %d", tt.path, resp.StatusCode, tt.wantStatus)
+		t.Logf("Response: %+v", resp)
+	}
+
+	if tt.wantBody != "" {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("Failed to read response body: %v", err)
 		}
+		gotBody := strings.TrimSpace(string(body))
+		if gotBody != tt.wantBody {
+			t.Errorf("path %q: got body = %q, want %q", tt.path, gotBody, tt.wantBody)
+		}
+	}
+}
+
+func TestProxyHandlerLoadConfig(t *testing.T) {
+	staticDir, files, cleanupFiles := setupTestFiles(t)
+	defer cleanupFiles()
+
+	configFile, cleanupConfig := createConfigFile(t, staticDir, files[2].path)
+	defer cleanupConfig()
+
+	ph := &ProxyHandler{
+		mux: http.NewServeMux(),
+	}
+	logger = log.New(ioutil.Discard, "", 0)
+
+	if err := ph.loadConfig(configFile); err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		path       string
+		wantStatus int
+		wantBody   string
+		skip       bool
+	}{
+		{"api endpoint", "/api", http.StatusBadGateway, "", true},
+		{"static file", "/static/index.html", http.StatusOK, "<html>test</html>", false},
+		{"static txt file", "/static/test.txt", http.StatusOK, "static test content", false},
+		{"static directory", "/static/", http.StatusOK, "", false},
+		{"single file", "/file", http.StatusOK, "single file test content", false},
+	}
+
+	server := httptest.NewServer(ph)
+	defer server.Close()
+
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reqURL := baseURL.ResolveReference(&url.URL{Path: tt.path})
-			resp, err := client.Get(reqURL.String())
-			if err != nil {
-				t.Fatalf("client.Get(%q) failed: %v", reqURL, err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != tt.wantStatus {
-				t.Errorf("path %q: got status = %d, want %d", tt.path, resp.StatusCode, tt.wantStatus)
-				t.Logf("Response: %+v", resp)
-			}
-
-			if tt.wantBody != "" {
-				body, err := ioutil.ReadAll(resp.Body)
-				if err != nil {
-					t.Fatalf("Failed to read response body: %v", err)
-				}
-				gotBody := strings.TrimSpace(string(body))
-				if gotBody != tt.wantBody {
-					t.Errorf("path %q: got body = %q, want %q", tt.path, gotBody, tt.wantBody)
-				}
-			}
+			runProxyTest(t, server, tt)
 		})
 	}
 }
