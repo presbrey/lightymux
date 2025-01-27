@@ -1,3 +1,8 @@
+[![Go Report Card](https://goreportcard.com/badge/github.com/presbrey/lightymux)](https://goreportcard.com/report/github.com/presbrey/lightymux)
+[![codecov](https://codecov.io/gh/presbrey/lightymux/graph/badge.svg?token=17BSEJBWVZ)](https://codecov.io/gh/presbrey/lightymux)
+[![Go](https://github.com/presbrey/lightymux/actions/workflows/go.yml/badge.svg)](https://github.com/presbrey/lightymux/actions/workflows/go.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/presbrey/lightymux.svg)](https://pkg.go.dev/github.com/presbrey/lightymux)
+
 # lightymux
 
 A lightweight (1 file), dynamic reverse proxy server with live configuration reloading capabilities. The code can be copied around easily and is good at maintaining long-lived sessions like WebSockets to subdaemons while other upstreams may be restarting like view servers.
