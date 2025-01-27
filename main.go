@@ -133,14 +133,6 @@ func modifyResponse(res *http.Response) error {
 	return nil
 }
 
-func errorHandler(w http.ResponseWriter, r *http.Request, err error) {
-	if logErrors {
-		logger.Printf("Proxy error: %v", err)
-	}
-	w.WriteHeader(http.StatusBadGateway)
-	w.Write([]byte("Proxy Error"))
-}
-
 func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ph.configLock.RLock()
 	defer ph.configLock.RUnlock()
@@ -201,7 +193,7 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() != 1 {
-		fmt.Println("Usage: ./reverse_proxy [flags] <config_file>")
+		fmt.Println("Usage: ./lightymux [flags] <config_file>")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
