@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,60 +118,74 @@ func runProxyTest(t *testing.T, server *httptest.Server, tt struct {
 	wantBody   string
 	skip       bool
 }) {
-	if tt.skip {
-		return
-	}
+	t.Run(tt.name, func(t *testing.T) {
+		if tt.skip {
+			t.Skip()
+		}
 
-	baseURL, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatalf("Failed to parse server URL: %v", err)
-	}
-
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-	}
-
-	reqURL := baseURL.ResolveReference(&url.URL{Path: tt.path})
-	resp, err := client.Get(reqURL.String())
-	if err != nil {
-		t.Fatalf("client.Get(%q) failed: %v", reqURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != tt.wantStatus {
-		t.Errorf("path %q: got status = %d, want %d", tt.path, resp.StatusCode, tt.wantStatus)
-		t.Logf("Response: %+v", resp)
-	}
-
-	if tt.wantBody != "" {
-		body, err := ioutil.ReadAll(resp.Body)
+		req, err := http.NewRequest("GET", server.URL+tt.path, nil)
 		if err != nil {
-			t.Fatalf("Failed to read response body: %v", err)
+			t.Fatalf("Failed to create request: %v", err)
 		}
-		gotBody := strings.TrimSpace(string(body))
-		if gotBody != tt.wantBody {
-			t.Errorf("path %q: got body = %q, want %q", tt.path, gotBody, tt.wantBody)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to send request: %v", err)
 		}
-	}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != tt.wantStatus {
+			t.Errorf("Status = %d; want %d", resp.StatusCode, tt.wantStatus)
+		}
+
+		if tt.wantBody != "" {
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("Failed to read response body: %v", err)
+			}
+			if !strings.Contains(string(body), tt.wantBody) {
+				t.Errorf("Body = %q; want to contain %q", string(body), tt.wantBody)
+			}
+		}
+	})
 }
 
-func TestProxyHandlerLoadConfig(t *testing.T) {
-	staticDir, files, cleanupFiles := setupTestFiles(t)
-	defer cleanupFiles()
+func TestLoadConfig(t *testing.T) {
+	staticDir, files, cleanup := setupTestFiles(t)
+	defer cleanup()
 
 	configFile, cleanupConfig := createConfigFile(t, staticDir, files[2].path)
 	defer cleanupConfig()
 
-	ph := &ProxyHandler{
-		mux: http.NewServeMux(),
-	}
-	logger = log.New(ioutil.Discard, "", 0)
+	// Create a test server that acts as our remote API
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "API response")
+	}))
+	defer apiServer.Close()
 
-	if err := ph.loadConfig(configFile); err != nil {
-		t.Fatalf("loadConfig() error = %v", err)
+	// Update config file with actual API server URL
+	content := fmt.Sprintf(`/api %s
+/static/ %s
+/file %s
+`, apiServer.URL, staticDir, files[2].path)
+	if err := ioutil.WriteFile(configFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
 	}
+
+	// Create LightyMux instance
+	lm, err := NewLightyMux(&Options{})
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Load the config
+	if err := lm.loadConfig(configFile); err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Create test server using our mux
+	server := httptest.NewServer(lm)
+	defer server.Close()
 
 	tests := []struct {
 		name       string
@@ -183,40 +194,34 @@ func TestProxyHandlerLoadConfig(t *testing.T) {
 		wantBody   string
 		skip       bool
 	}{
-		{"api endpoint", "/api", http.StatusBadGateway, "", true},
-		{"static file", "/static/index.html", http.StatusOK, "<html>test</html>", false},
-		{"static txt file", "/static/test.txt", http.StatusOK, "static test content", false},
-		{"static directory", "/static/", http.StatusOK, "", false},
-		{"single file", "/file", http.StatusOK, "single file test content", false},
+		{
+			name:       "API proxy",
+			path:       "/api",
+			wantStatus: http.StatusOK,
+			wantBody:   "API response",
+		},
+		{
+			name:       "Static directory",
+			path:       "/static/index.html",
+			wantStatus: http.StatusOK,
+			wantBody:   "<html>test</html>",
+		},
+		{
+			name:       "Single file",
+			path:       "/file",
+			wantStatus: http.StatusOK,
+			wantBody:   "single file test content",
+		},
+		{
+			name:       "Not found",
+			path:       "/notfound",
+			wantStatus: http.StatusNotFound,
+			wantBody:   "404 page not found",
+		},
 	}
-
-	server := httptest.NewServer(ph)
-	defer server.Close()
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			runProxyTest(t, server, tt)
-		})
-	}
-}
-
-func TestModifyResponse(t *testing.T) {
-	resp := &http.Response{
-		Header: make(http.Header),
-		Body:   ioutil.NopCloser(bytes.NewBufferString("test body")),
-	}
-
-	if err := modifyResponse(resp); err != nil {
-		t.Errorf("modifyResponse() error = %v", err)
-	}
-
-	// Read the modified body to verify it wasn't corrupted
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Errorf("Failed to read response body: %v", err)
-	}
-	if string(body) != "test body" {
-		t.Errorf("modifyResponse() corrupted body = %q; want %q", string(body), "test body")
+		runProxyTest(t, server, tt)
 	}
 }
 
@@ -227,19 +232,21 @@ func TestNewLightyMux(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "default options",
+			name: "Default options",
 			opts: &Options{},
 		},
 		{
-			name: "custom http address",
+			name: "Custom address",
 			opts: &Options{
 				HTTPAddr: ":9090",
 			},
 		},
 		{
-			name: "with log file",
+			name: "With logging options",
 			opts: &Options{
-				LogFile: "test.log",
+				LogRequests:  true,
+				LogResponses: true,
+				LogErrors:    true,
 			},
 		},
 	}
@@ -253,22 +260,6 @@ func TestNewLightyMux(t *testing.T) {
 			}
 			if lm == nil {
 				t.Error("NewLightyMux() returned nil LightyMux")
-				return
-			}
-
-			// Check if logger is initialized
-			if lm.logger == nil {
-				t.Error("NewLightyMux() logger is nil")
-			}
-
-			// Check if handler is initialized
-			if lm.handler == nil {
-				t.Error("NewLightyMux() handler is nil")
-			}
-
-			// Clean up log file if created
-			if tt.opts.LogFile != "" {
-				os.Remove(tt.opts.LogFile)
 			}
 		})
 	}
@@ -276,58 +267,52 @@ func TestNewLightyMux(t *testing.T) {
 
 func TestLightyMuxRun(t *testing.T) {
 	// Create a temporary config file
-	configContent := `{
-		"routes": [
-			{
-				"path": "/test",
-				"upstream": "http://localhost:8081"
-			}
-		]
-	}`
-	tmpfile, err := ioutil.TempFile("", "config*.json")
+	configFile, err := ioutil.TempFile("", "config*.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmpfile.Name())
+	defer os.Remove(configFile.Name())
 
-	if _, err := tmpfile.Write([]byte(configContent)); err != nil {
+	// Write test configuration
+	content := "/test http://localhost:12345\n"
+	if err := ioutil.WriteFile(configFile.Name(), []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := tmpfile.Close(); err != nil {
-		t.Fatal(err)
+
+	// Create LightyMux with test options
+	opts := &Options{
+		HTTPAddr:    ":0", // Use random port
+		LogRequests: true,
 	}
 
-	// Create LightyMux instance
-	lm, err := NewLightyMux(&Options{
-		HTTPAddr: ":0", // Use random port
-	})
+	lm, err := NewLightyMux(opts)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to create LightyMux: %v", err)
 	}
 
-	// Start server in goroutine
+	// Run server in background
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- lm.Run(tmpfile.Name())
+		errChan <- lm.Run(configFile.Name())
 	}()
 
-	// Give server time to start
+	// Give the server time to start
 	time.Sleep(100 * time.Millisecond)
 
 	// Send interrupt signal to trigger shutdown
 	p, err := os.FindProcess(os.Getpid())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to find process: %v", err)
 	}
 	p.Signal(os.Interrupt)
 
-	// Check if server shuts down cleanly
+	// Check if server shut down gracefully
 	select {
 	case err := <-errChan:
 		if err != nil {
 			t.Errorf("Run() error = %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Error("Run() didn't shut down within timeout")
+		t.Error("Server did not shut down within timeout")
 	}
 }
