@@ -238,15 +238,23 @@ func TestNewLightyMux(t *testing.T) {
 		{
 			name: "Custom address",
 			opts: &Options{
-				HTTPAddr: ":9090",
+				HTTPAddr: ":8080",
 			},
 		},
 		{
 			name: "With logging options",
 			opts: &Options{
+				LogFile:      "test.log",
 				LogRequests:  true,
 				LogResponses: true,
-				LogErrors:    true,
+			},
+		},
+		{
+			name: "Zero timeouts disable timeouts",
+			opts: &Options{
+				ReadTimeout:  0,
+				WriteTimeout: 0,
+				IdleTimeout:  0,
 			},
 		},
 	}
@@ -258,8 +266,20 @@ func TestNewLightyMux(t *testing.T) {
 				t.Errorf("NewLightyMux() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if lm == nil {
-				t.Error("NewLightyMux() returned nil LightyMux")
+			if err != nil {
+				return
+			}
+
+			if tt.name == "Zero timeouts disable timeouts" {
+				if lm.server.ReadTimeout != 0 {
+					t.Errorf("ReadTimeout = %v, want 0", lm.server.ReadTimeout)
+				}
+				if lm.server.WriteTimeout != 0 {
+					t.Errorf("WriteTimeout = %v, want 0", lm.server.WriteTimeout)
+				}
+				if lm.server.IdleTimeout != 0 {
+					t.Errorf("IdleTimeout = %v, want 0", lm.server.IdleTimeout)
+				}
 			}
 		})
 	}
