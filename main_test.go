@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsWebScheme(t *testing.T) {
@@ -216,5 +217,117 @@ func TestModifyResponse(t *testing.T) {
 	}
 	if string(body) != "test body" {
 		t.Errorf("modifyResponse() corrupted body = %q; want %q", string(body), "test body")
+	}
+}
+
+func TestNewLightyMux(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    *Options
+		wantErr bool
+	}{
+		{
+			name: "default options",
+			opts: &Options{},
+		},
+		{
+			name: "custom http address",
+			opts: &Options{
+				HTTPAddr: ":9090",
+			},
+		},
+		{
+			name: "with log file",
+			opts: &Options{
+				LogFile: "test.log",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lm, err := NewLightyMux(tt.opts)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("NewLightyMux() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if lm == nil {
+				t.Error("NewLightyMux() returned nil LightyMux")
+				return
+			}
+
+			// Check if logger is initialized
+			if lm.logger == nil {
+				t.Error("NewLightyMux() logger is nil")
+			}
+
+			// Check if handler is initialized
+			if lm.handler == nil {
+				t.Error("NewLightyMux() handler is nil")
+			}
+
+			// Clean up log file if created
+			if tt.opts.LogFile != "" {
+				os.Remove(tt.opts.LogFile)
+			}
+		})
+	}
+}
+
+func TestLightyMuxRun(t *testing.T) {
+	// Create a temporary config file
+	configContent := `{
+		"routes": [
+			{
+				"path": "/test",
+				"upstream": "http://localhost:8081"
+			}
+		]
+	}`
+	tmpfile, err := ioutil.TempFile("", "config*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write([]byte(configContent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create LightyMux instance
+	lm, err := NewLightyMux(&Options{
+		HTTPAddr: ":0", // Use random port
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start server in goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- lm.Run(tmpfile.Name())
+	}()
+
+	// Give server time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Send interrupt signal to trigger shutdown
+	p, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Signal(os.Interrupt)
+
+	// Check if server shuts down cleanly
+	select {
+	case err := <-errChan:
+		if err != nil {
+			t.Errorf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Run() didn't shut down within timeout")
 	}
 }
