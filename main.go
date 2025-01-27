@@ -37,11 +37,11 @@ func isWebScheme(s string) bool {
 
 // LightyMux is the main application struct that coordinates all components
 type LightyMux struct {
-	Options    *Options
-	server     *http.Server
-	logger     *log.Logger
-	mux        *http.ServeMux
-	configLock sync.RWMutex
+	options *Options
+	logger  *log.Logger
+	server  *http.Server
+	mux     *http.ServeMux
+	muxLock sync.RWMutex
 }
 
 // NewLightyMux creates a new LightyMux instance with the given options
@@ -61,10 +61,10 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 	}
 
 	l := &LightyMux{
-		Options:    opts,
-		logger:     log.New(logWriter, "", log.LstdFlags),
-		mux:        http.NewServeMux(),
-		configLock: sync.RWMutex{},
+		options: opts,
+		logger:  log.New(logWriter, "", log.LstdFlags),
+		mux:     http.NewServeMux(),
+		muxLock: sync.RWMutex{},
 	}
 
 	// Set up HTTP server
@@ -76,7 +76,21 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 	return l, nil
 }
 
-func (l *LightyMux) loadConfig(filename string) error {
+func (lm *LightyMux) newReverseProxy(nextHop *url.URL) *httputil.ReverseProxy {
+	rp := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = nextHop.Scheme
+			req.URL.Host = nextHop.Host
+			req.URL.Path = singleJoiningSlash(nextHop.Path, req.URL.Path)
+		},
+	}
+	if lm.options.LogResponses {
+		rp.ModifyResponse = lm.modifyResponse
+	}
+	return rp
+}
+
+func (lm *LightyMux) loadConfig(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
@@ -98,24 +112,17 @@ func (l *LightyMux) loadConfig(filename string) error {
 			// Handle remote URL
 			nextHop, err := url.Parse(target)
 			if err != nil {
-				l.logger.Printf("Error parsing URL %s: %v", target, err)
+				lm.logger.Printf("Error parsing URL %s: %v", target, err)
 				continue
 			}
-			proxy := &httputil.ReverseProxy{
-				Director: func(req *http.Request) {
-					req.URL.Scheme = nextHop.Scheme
-					req.URL.Host = nextHop.Host
-					req.URL.Path = singleJoiningSlash(nextHop.Path, req.URL.Path)
-				},
-				ModifyResponse: l.modifyResponse,
-			}
+			proxy := lm.newReverseProxy(nextHop)
 			newMux.Handle(path, proxy)
-			l.logger.Printf("Added remote route: %s -> %s", path, nextHop)
+			lm.logger.Printf("Added remote route: %s -> %s", path, nextHop)
 		} else {
 			// Handle local filesystem path
 			fileInfo, err := os.Stat(target)
 			if err != nil {
-				l.logger.Printf("Error accessing path %s: %v", target, err)
+				lm.logger.Printf("Error accessing path %s: %v", target, err)
 				continue
 			}
 
@@ -123,7 +130,7 @@ func (l *LightyMux) loadConfig(filename string) error {
 				// Serve directory
 				fs := http.FileServer(http.Dir(target))
 				newMux.Handle(path, http.StripPrefix(path, fs))
-				l.logger.Printf("Added directory route: %s -> %s", path, target)
+				lm.logger.Printf("Added directory route: %s -> %s", path, target)
 			} else {
 				// Serve single file
 				fs := http.FileServer(http.Dir(filepath.Dir(target)))
@@ -131,7 +138,7 @@ func (l *LightyMux) loadConfig(filename string) error {
 					r.URL.Path = filepath.Base(target)
 					fs.ServeHTTP(w, r)
 				})))
-				l.logger.Printf("Added file route: %s -> %s", path, target)
+				lm.logger.Printf("Added file route: %s -> %s", path, target)
 			}
 		}
 	}
@@ -140,25 +147,25 @@ func (l *LightyMux) loadConfig(filename string) error {
 		return err
 	}
 
-	l.configLock.Lock()
-	l.mux = newMux
-	l.configLock.Unlock()
+	lm.muxLock.Lock()
+	lm.mux = newMux
+	lm.muxLock.Unlock()
 
 	return nil
 }
 
-func (l *LightyMux) modifyResponse(res *http.Response) error {
-	if l.Options.LogResponses {
+func (lm *LightyMux) modifyResponse(res *http.Response) error {
+	if lm.options.LogResponses {
 		dump, err := httputil.DumpResponse(res, true)
 		if err != nil {
 			return err
 		}
-		l.logger.Printf("Response: %s", string(dump))
+		lm.logger.Printf("Response: %s", string(dump))
 	}
 	return nil
 }
 
-func (l *LightyMux) watchConfig(filename string) error {
+func (lm *LightyMux) watchConfig(filename string) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -172,16 +179,16 @@ func (l *LightyMux) watchConfig(filename string) error {
 					return
 				}
 				if event.Op&fsnotify.Write == fsnotify.Write {
-					l.logger.Printf("Config file modified. Reloading...")
-					if err := l.loadConfig(filename); err != nil {
-						l.logger.Printf("Error reloading config: %v", err)
+					lm.logger.Printf("Config file modified. Reloading...")
+					if err := lm.loadConfig(filename); err != nil {
+						lm.logger.Printf("Error reloading config: %v", err)
 					}
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
-				l.logger.Printf("Error watching config file: %v", err)
+				lm.logger.Printf("Error watching config file: %v", err)
 			}
 		}
 	}()
@@ -190,14 +197,14 @@ func (l *LightyMux) watchConfig(filename string) error {
 }
 
 // ServeHTTP implements the http.Handler interface
-func (l *LightyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if l.Options.LogRequests {
+func (lm *LightyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if lm.options.LogRequests {
 		dump, _ := httputil.DumpRequest(r, true)
-		l.logger.Printf("Request: %s", string(dump))
+		lm.logger.Printf("Request: %s", string(dump))
 	}
-	l.configLock.RLock()
-	mux := l.mux
-	l.configLock.RUnlock()
+	lm.muxLock.RLock()
+	mux := lm.mux
+	lm.muxLock.RUnlock()
 	mux.ServeHTTP(w, r)
 }
 
@@ -213,14 +220,14 @@ func singleJoiningSlash(a, b string) string {
 	return a + b
 }
 
-func (l *LightyMux) Run(configFile string) error {
+func (lm *LightyMux) Run(configFile string) error {
 	// Initialize proxy handler with config
-	if err := l.loadConfig(configFile); err != nil {
+	if err := lm.loadConfig(configFile); err != nil {
 		return fmt.Errorf("error loading config: %v", err)
 	}
 
 	// Start config file watcher
-	if err := l.watchConfig(configFile); err != nil {
+	if err := lm.watchConfig(configFile); err != nil {
 		return err
 	}
 
@@ -232,15 +239,15 @@ func (l *LightyMux) Run(configFile string) error {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, os.Interrupt)
 		<-sigChan
-		l.logger.Println("Shutting down server...")
-		if err := l.server.Shutdown(ctx); err != nil {
-			l.logger.Printf("Error during server shutdown: %v", err)
+		lm.logger.Println("Shutting down server...")
+		if err := lm.server.Shutdown(ctx); err != nil {
+			lm.logger.Printf("Error during server shutdown: %v", err)
 		}
 		cancel()
 	}()
 
-	l.logger.Printf("Starting reverse proxy on %s", l.Options.HTTPAddr)
-	if err := l.server.ListenAndServe(); err != http.ErrServerClosed {
+	lm.logger.Printf("Starting reverse proxy on %s", lm.options.HTTPAddr)
+	if err := lm.server.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("error starting server: %v", err)
 	}
 
