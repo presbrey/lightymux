@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -164,9 +165,13 @@ func TestLoadConfig(t *testing.T) {
 	defer apiServer.Close()
 
 	// Update config file with actual API server URL
-	content := fmt.Sprintf(`/api %s
-/static/ %s
-/file %s
+	content := fmt.Sprintf(`
+/api:
+  target: %s
+/static/:
+  target: %s
+/file:
+  target: %s
 `, apiServer.URL, staticDir, files[2].path)
 	if err := ioutil.WriteFile(configFile, []byte(content), 0644); err != nil {
 		t.Fatal(err)
@@ -287,14 +292,17 @@ func TestNewLightyMux(t *testing.T) {
 
 func TestLightyMuxRun(t *testing.T) {
 	// Create a temporary config file
-	configFile, err := ioutil.TempFile("", "config*.txt")
+	configFile, err := ioutil.TempFile("", "config*.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.Remove(configFile.Name())
 
-	// Write test configuration
-	content := "/test http://localhost:12345\n"
+	// Write test configuration in YAML format
+	content := `
+/test:
+  target: http://localhost:12345
+`
 	if err := ioutil.WriteFile(configFile.Name(), []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -310,21 +318,21 @@ func TestLightyMuxRun(t *testing.T) {
 		t.Fatalf("Failed to create LightyMux: %v", err)
 	}
 
+	// Create a context with cancel for shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Run server in background
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- lm.Run(configFile.Name())
+		errChan <- lm.Run(ctx, configFile.Name())
 	}()
 
 	// Give the server time to start
 	time.Sleep(100 * time.Millisecond)
 
-	// Send interrupt signal to trigger shutdown
-	p, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("Failed to find process: %v", err)
-	}
-	p.Signal(os.Interrupt)
+	// Trigger graceful shutdown via context
+	cancel()
 
 	// Check if server shut down gracefully
 	select {
@@ -335,4 +343,156 @@ func TestLightyMuxRun(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Error("Server did not shut down within timeout")
 	}
+}
+
+func TestHeaderModification(t *testing.T) {
+	// Create a test server that echoes headers
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Echo request headers in response
+		w.Header().Set("X-Request-Accept", strings.Join(r.Header.Values("Accept"), ", "))
+		w.Header().Set("X-Request-Custom", strings.Join(r.Header.Values("X-Custom"), ", "))
+		w.Header().Set("X-Request-Auth", r.Header.Get("Authorization"))
+		w.Header().Set("X-Request-Old", r.Header.Get("X-Old-Header"))
+
+		// Add some headers that will be modified
+		w.Header().Set("X-Internal-Header", "secret")
+		w.Header().Add("Access-Control-Allow-Methods", "GET")
+	}))
+	defer ts.Close()
+
+	// Create config file with header modifications
+	configFile, err := ioutil.TempFile("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(configFile.Name())
+
+	content := fmt.Sprintf(`
+/test:
+  target: %s
+  rules:
+    - request:
+        headers:
+          header-add:
+            Accept: ["application/json", "text/plain"]
+            X-Custom: ["value1", "value2"]
+          header-set:
+            Authorization: "Bearer token123"
+          header-del:
+            - "X-Old-Header"
+    - response:
+        headers:
+          header-add:
+            Access-Control-Allow-Methods: ["POST", "OPTIONS"]
+          header-set:
+            Access-Control-Allow-Origin: "*"
+          header-del:
+            - "X-Internal-Header"
+`, ts.URL)
+
+	if err := ioutil.WriteFile(configFile.Name(), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create LightyMux instance
+	opts := &Options{
+		HTTPAddr:    "127.0.0.1:0", // Use random port on localhost
+		LogRequests: true,
+	}
+
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- lm.Run(ctx, configFile.Name())
+	}()
+
+	// Wait for server to start and get its address
+	time.Sleep(100 * time.Millisecond)
+
+	// Get the actual server address
+	serverAddr := lm.server.Addr
+	if serverAddr == "" {
+		t.Fatal("Server address is empty")
+	}
+
+	// Make request to test server
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/test", serverAddr), nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("X-Old-Header", "should-be-removed")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify request header modifications
+	acceptHeaders := strings.Split(resp.Header.Get("X-Request-Accept"), ", ")
+	if !containsAll(acceptHeaders, []string{"application/json", "text/plain"}) {
+		t.Errorf("Accept header = %q, want both application/json and text/plain", acceptHeaders)
+	}
+
+	customHeaders := strings.Split(resp.Header.Get("X-Request-Custom"), ", ")
+	if !containsAll(customHeaders, []string{"value1", "value2"}) {
+		t.Errorf("X-Custom header = %q, want both value1 and value2", customHeaders)
+	}
+
+	if got := resp.Header.Get("X-Request-Auth"); got != "Bearer token123" {
+		t.Errorf("Authorization header = %q, want Bearer token123", got)
+	}
+	if got := resp.Header.Get("X-Request-Old"); got != "" {
+		t.Errorf("X-Old-Header = %q, want empty (header should be deleted)", got)
+	}
+
+	// Verify response header modifications
+	methods := resp.Header.Values("Access-Control-Allow-Methods")
+	if !containsAll(methods, []string{"GET", "POST", "OPTIONS"}) {
+		t.Errorf("Access-Control-Allow-Methods = %v, want [GET POST OPTIONS]", methods)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want *", got)
+	}
+	if got := resp.Header.Get("X-Internal-Header"); got != "" {
+		t.Errorf("X-Internal-Header = %q, want empty (header should be deleted)", got)
+	}
+
+	// Shutdown server
+	cancel()
+	select {
+	case err := <-errChan:
+		if err != nil {
+			t.Errorf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Server did not shut down within timeout")
+	}
+}
+
+func contains(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAll(slice []string, items []string) bool {
+	for _, item := range items {
+		if !contains(slice, item) {
+			return false
+		}
+	}
+	return true
 }

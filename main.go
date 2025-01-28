@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,10 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"os/signal"
-
 	"github.com/caarlos0/env/v11"
 	"github.com/fsnotify/fsnotify"
+	"gopkg.in/yaml.v3"
 )
 
 // Options holds the application configuration
@@ -36,6 +35,40 @@ type Options struct {
 	LogFile       string        `env:"LOG_FILE" envDefault:""`
 	HealthCheck   string        `env:"HEALTH_CHECK" envDefault:"/health"`
 	RetryAttempts int           `env:"RETRY_ATTEMPTS" envDefault:"3"`
+}
+
+// RouteConfig represents a single route configuration
+type RouteConfig struct {
+	Target string       `yaml:"target"`
+	Rules  []RuleConfig `yaml:"rules,omitempty"`
+}
+
+// RuleConfig represents rules for request/response modification
+type RuleConfig struct {
+	Request  RequestConfig  `yaml:"request,omitempty"`
+	Response ResponseConfig `yaml:"response,omitempty"`
+}
+
+// HeaderOperations represents the different types of header modifications
+type HeaderOperations struct {
+	Add map[string][]string `yaml:"header-add,omitempty"` // Add values to existing header
+	Set map[string]string   `yaml:"header-set,omitempty"` // Set header to this value, replacing any existing
+	Del []string            `yaml:"header-del,omitempty"` // Delete these headers
+}
+
+// RequestConfig represents request modification rules
+type RequestConfig struct {
+	Headers HeaderOperations `yaml:"headers,omitempty"`
+}
+
+// ResponseConfig represents response modification rules
+type ResponseConfig struct {
+	Headers HeaderOperations `yaml:"headers,omitempty"`
+}
+
+// MuxConfig represents the full YAML configuration
+type MuxConfig struct {
+	Routes map[string]RouteConfig `yaml:",inline"`
 }
 
 func isWebScheme(s string) bool {
@@ -87,7 +120,6 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 
 	// Set up HTTP server with timeouts
 	l.server = &http.Server{
-		Addr:         opts.HTTPAddr,
 		Handler:      l,
 		ReadTimeout:  opts.ReadTimeout,  // 0 means no timeout
 		WriteTimeout: opts.WriteTimeout, // 0 means no timeout
@@ -137,22 +169,24 @@ func (lm *LightyMux) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (lm *LightyMux) loadConfig(filename string) error {
-	file, err := os.Open(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read config file: %v", err)
 	}
-	defer file.Close()
+
+	var config MuxConfig
+	if err := yaml.Unmarshal(data, &config.Routes); err != nil {
+		return fmt.Errorf("failed to parse YAML: %v", err)
+	}
 
 	newMux := http.NewServeMux()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.Fields(scanner.Text())
-		if len(parts) != 2 {
+	for path, route := range config.Routes {
+		target := route.Target
+		if target == "" {
+			lm.logger.Printf("Skipping route %s: no target specified", path)
 			continue
 		}
-		path := parts[0]
-		target := parts[1]
 
 		if isWebScheme(target) {
 			// Handle remote URL
@@ -162,6 +196,51 @@ func (lm *LightyMux) loadConfig(filename string) error {
 				continue
 			}
 			proxy := lm.newReverseProxy(nextHop)
+
+			// Apply request/response rules if any
+			if len(route.Rules) > 0 {
+				originalDirector := proxy.Director
+				proxy.Director = func(req *http.Request) {
+					originalDirector(req)
+					for _, rule := range route.Rules {
+						for key, values := range rule.Request.Headers.Add {
+							for _, value := range values {
+								req.Header.Add(key, value)
+							}
+						}
+						for key, value := range rule.Request.Headers.Set {
+							req.Header.Set(key, value)
+						}
+						for _, key := range rule.Request.Headers.Del {
+							req.Header.Del(key)
+						}
+					}
+				}
+
+				originalModifyResponse := proxy.ModifyResponse
+				proxy.ModifyResponse = func(res *http.Response) error {
+					if originalModifyResponse != nil {
+						if err := originalModifyResponse(res); err != nil {
+							return err
+						}
+					}
+					for _, rule := range route.Rules {
+						for key, values := range rule.Response.Headers.Add {
+							for _, value := range values {
+								res.Header.Add(key, value)
+							}
+						}
+						for key, value := range rule.Response.Headers.Set {
+							res.Header.Set(key, value)
+						}
+						for _, key := range rule.Response.Headers.Del {
+							res.Header.Del(key)
+						}
+					}
+					return nil
+				}
+			}
+
 			newMux.Handle(path, proxy)
 			lm.logger.Printf("Added remote route: %s -> %s", path, nextHop)
 		} else {
@@ -173,12 +252,10 @@ func (lm *LightyMux) loadConfig(filename string) error {
 			}
 
 			if fileInfo.IsDir() {
-				// Serve directory
 				fs := http.FileServer(http.Dir(target))
 				newMux.Handle(path, http.StripPrefix(path, fs))
 				lm.logger.Printf("Added directory route: %s -> %s", path, target)
 			} else {
-				// Serve single file
 				fs := http.FileServer(http.Dir(filepath.Dir(target)))
 				newMux.Handle(path, http.StripPrefix(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					r.URL.Path = filepath.Base(target)
@@ -187,10 +264,6 @@ func (lm *LightyMux) loadConfig(filename string) error {
 				lm.logger.Printf("Added file route: %s -> %s", path, target)
 			}
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 
 	lm.muxLock.Lock()
@@ -266,7 +339,7 @@ func singleJoiningSlash(a, b string) string {
 	return a + b
 }
 
-func (lm *LightyMux) Run(configFile string) error {
+func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 	if err := lm.loadConfig(configFile); err != nil {
 		return fmt.Errorf("failed to load config: %v", err)
 	}
@@ -275,20 +348,24 @@ func (lm *LightyMux) Run(configFile string) error {
 		return fmt.Errorf("failed to watch config: %v", err)
 	}
 
-	// Set up graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	// Create listener first to get the actual port
+	ln, err := net.Listen("tcp", lm.options.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("failed to create listener: %v", err)
+	}
+
+	// Update server address with actual address
+	lm.server.Addr = ln.Addr().String()
+	lm.logger.Printf("Server started on %s", lm.server.Addr)
 
 	// Start server in a goroutine
 	go func() {
-		if err := lm.server.ListenAndServe(); err != http.ErrServerClosed {
+		if err := lm.server.Serve(ln); err != http.ErrServerClosed {
 			lm.logger.Printf("HTTP server error: %v", err)
 		}
 	}()
 
-	lm.logger.Printf("Server started on %s", lm.server.Addr)
-
-	// Wait for interrupt signal
+	// Wait for shutdown signal
 	<-ctx.Done()
 	lm.logger.Println("Shutting down server...")
 
@@ -334,7 +411,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := lm.Run(flag.Arg(0)); err != nil {
+	if err := lm.Run(context.Background(), flag.Arg(0)); err != nil {
 		fmt.Printf("Error running LightyMux: %v\n", err)
 		os.Exit(1)
 	}
