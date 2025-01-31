@@ -217,13 +217,7 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 	l := &LightyMux{
 		options: opts,
 		logger:  log.New(logWriter, "", log.LstdFlags),
-		mux:     http.NewServeMux(),
 		muxLock: sync.RWMutex{},
-	}
-
-	// Add health check endpoint only if HealthRoute is non-blank
-	if opts.HealthRoute != "" {
-		l.mux.HandleFunc(opts.HealthRoute, l.handleHealthCheck)
 	}
 
 	// Set up HTTP server with timeouts
@@ -323,6 +317,11 @@ func (lm *LightyMux) watchConfig(configPath string) error {
 
 func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 	newMux := http.NewServeMux()
+
+	// Add health check endpoint only if HealthRoute is non-blank
+	if lm.options.HealthRoute != "" {
+		newMux.HandleFunc(lm.options.HealthRoute, lm.handleHealthCheck)
+	}
 
 	// Log the config reload
 	lm.logger.Printf("Config file modified. Reloading...")
