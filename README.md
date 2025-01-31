@@ -51,8 +51,7 @@ go build
 - `LOG_RESPONSES`: Log outgoing responses (default: false)
 - `LOG_ERRORS`: Log proxy errors (default: true)
 - `LOG_FILE`: Log to file instead of stderr
-- `HEALTH_CHECK`: Health check endpoint path (default: "/health")
-- `RETRY_ATTEMPTS`: Number of retry attempts (default: 3)
+- `HEALTH_ROUTE`: Health check route path (default: "/health")
 
 ### Configuration File Format
 

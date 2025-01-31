@@ -11,7 +11,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -23,18 +22,18 @@ import (
 
 // Options holds the application configuration
 type Options struct {
-	HTTPAddr      string        `env:"HTTP_ADDR" envDefault:""`
-	ReadTimeout   time.Duration `env:"READ_TIMEOUT" envDefault:"30s"`
-	WriteTimeout  time.Duration `env:"WRITE_TIMEOUT" envDefault:"30s"`
-	IdleTimeout   time.Duration `env:"IDLE_TIMEOUT" envDefault:"60s"`
-	ProxyTimeout  time.Duration `env:"PROXY_TIMEOUT" envDefault:"60s"`
-	Verbose       bool          `env:"VERBOSE" envDefault:"false"`
-	LogRequests   bool          `env:"LOG_REQUESTS" envDefault:"false"`
-	LogResponses  bool          `env:"LOG_RESPONSES" envDefault:"false"`
-	LogErrors     bool          `env:"LOG_ERRORS" envDefault:"true"`
-	LogFile       string        `env:"LOG_FILE" envDefault:""`
-	HealthCheck   string        `env:"HEALTH_CHECK" envDefault:"/health"`
-	RetryAttempts int           `env:"RETRY_ATTEMPTS" envDefault:"3"`
+	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:""`
+	ReadTimeout           time.Duration `env:"READ_TIMEOUT" envDefault:"30s"`
+	WriteTimeout          time.Duration `env:"WRITE_TIMEOUT" envDefault:"30s"`
+	IdleTimeout           time.Duration `env:"IDLE_TIMEOUT" envDefault:"60s"`
+	ProxyTimeout          time.Duration `env:"PROXY_TIMEOUT" envDefault:"60s"`
+	ConfigRefreshInterval time.Duration `env:"CONFIG_REFRESH_INTERVAL" envDefault:"1m"`
+	Verbose               bool          `env:"VERBOSE" envDefault:"false"`
+	LogRequests           bool          `env:"LOG_REQUESTS" envDefault:"false"`
+	LogResponses          bool          `env:"LOG_RESPONSES" envDefault:"false"`
+	LogErrors             bool          `env:"LOG_ERRORS" envDefault:"true"`
+	LogFile               string        `env:"LOG_FILE" envDefault:""`
+	HealthRoute           string        `env:"HEALTH_ROUTE" envDefault:""`
 }
 
 // MuxConfig represents the full YAML configuration
@@ -75,27 +74,134 @@ func isWebScheme(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
+// ConfigReloader is an interface for loading and watching configuration
+type ConfigReloader interface {
+	Load() ([]byte, error)
+	Watch(callback func([]byte, error)) error
+	Close() error
+}
+
+// LocalFileLoader implements ConfigReloader for local files
+type LocalReloader struct {
+	path    string
+	watcher *fsnotify.Watcher
+}
+
+func NewLocalReloader(path string) (*LocalReloader, error) {
+	return &LocalReloader{path: path}, nil
+}
+
+func (l *LocalReloader) Load() ([]byte, error) {
+	return os.ReadFile(l.path)
+}
+
+func (l *LocalReloader) Watch(callback func([]byte, error)) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	l.watcher = watcher
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					// Add a small delay to ensure the file write is complete
+					time.Sleep(50 * time.Millisecond)
+					data, err := l.Load()
+					callback(data, err)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				callback(nil, err)
+			}
+		}
+	}()
+
+	return watcher.Add(l.path)
+}
+
+func (l *LocalReloader) Close() error {
+	if l.watcher != nil {
+		return l.watcher.Close()
+	}
+	return nil
+}
+
+// RemoteReloader implements ConfigReloader for HTTP URLs
+type RemoteReloader struct {
+	url      string
+	interval time.Duration
+	done     chan struct{}
+}
+
+func NewRemoteReloader(url string, interval time.Duration) (*RemoteReloader, error) {
+	return &RemoteReloader{
+		url:      url,
+		interval: interval,
+		done:     make(chan struct{}),
+	}, nil
+}
+
+func (r *RemoteReloader) Load() ([]byte, error) {
+	resp, err := http.Get(r.url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+func (h *RemoteReloader) Watch(callback func([]byte, error)) error {
+	ticker := time.NewTicker(h.interval)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				data, err := h.Load()
+				callback(data, err)
+			case <-h.done:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+func (h *RemoteReloader) Close() error {
+	close(h.done)
+	return nil
+}
+
+// NewConfigReloader creates the appropriate ConfigReloader based on the path
+func NewConfigReloader(path string, refreshInterval time.Duration) (ConfigReloader, error) {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return NewRemoteReloader(path, refreshInterval)
+	}
+	return NewLocalReloader(path)
+}
+
 // LightyMux is the main application struct that coordinates all components
 type LightyMux struct {
-	options *Options
-	logger  *log.Logger
-	server  *http.Server
-	mux     *http.ServeMux
-	muxLock sync.RWMutex
+	options  *Options
+	logger   *log.Logger
+	server   *http.Server
+	mux      *http.ServeMux
+	muxLock  sync.RWMutex
+	reloader ConfigReloader
 }
 
 // NewLightyMux creates a new LightyMux instance with the given options
 func NewLightyMux(opts *Options) (*LightyMux, error) {
 	if opts == nil {
-		opts = &Options{}
-	}
-
-	// Set default values if not provided
-	if opts.HealthCheck == "" {
-		opts.HealthCheck = "/health"
-	}
-	if opts.RetryAttempts == 0 {
-		opts.RetryAttempts = 3
+		return nil, fmt.Errorf("options cannot be nil")
 	}
 
 	// Configure logging
@@ -115,8 +221,10 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 		muxLock: sync.RWMutex{},
 	}
 
-	// Add health check endpoint
-	l.mux.HandleFunc(opts.HealthCheck, l.handleHealthCheck)
+	// Add health check endpoint only if HealthRoute is non-blank
+	if opts.HealthRoute != "" {
+		l.mux.HandleFunc(opts.HealthRoute, l.handleHealthCheck)
+	}
 
 	// Set up HTTP server with timeouts
 	l.server = &http.Server{
@@ -164,18 +272,60 @@ func (lm *LightyMux) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"healthy","timestamp":"%s"}`, time.Now().Format(time.RFC3339))
 }
 
-func (lm *LightyMux) loadConfig(filename string) error {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("failed to read config file: %v", err)
+func (lm *LightyMux) initReloader(configPath string) error {
+	if lm.reloader == nil {
+		reloader, err := NewConfigReloader(configPath, lm.options.ConfigRefreshInterval)
+		if err != nil {
+			return fmt.Errorf("failed to create config reloader: %v", err)
+		}
+		data, err := reloader.Load()
+		if err != nil {
+			return fmt.Errorf("failed to load initial config: %v", err)
+		}
+		err = lm.processConfig(data)
+		if err != nil {
+			return fmt.Errorf("failed to process initial config: %v", err)
+		}
+		lm.reloader = reloader
 	}
+	return nil
+}
 
+func (lm *LightyMux) processConfig(data []byte) error {
 	var config LightyConfig
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return fmt.Errorf("failed to parse YAML: %v", err)
 	}
 
+	if err := lm.applyConfig(&config); err != nil {
+		return fmt.Errorf("failed to apply config: %v", err)
+	}
+
+	return nil
+}
+
+func (lm *LightyMux) watchConfig(configPath string) error {
+	if err := lm.initReloader(configPath); err != nil {
+		return err
+	}
+
+	return lm.reloader.Watch(func(data []byte, err error) {
+		if err != nil {
+			lm.logger.Printf("Error loading config: %v", err)
+			return
+		}
+
+		if err := lm.processConfig(data); err != nil {
+			lm.logger.Printf("Error applying config: %v", err)
+		}
+	})
+}
+
+func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 	newMux := http.NewServeMux()
+
+	// Log the config reload
+	lm.logger.Printf("Config file modified. Reloading...")
 
 	for path, route := range config.Routes {
 		target := route.Target
@@ -185,7 +335,6 @@ func (lm *LightyMux) loadConfig(filename string) error {
 		}
 
 		if isWebScheme(target) {
-			// Handle remote URL
 			nextHop, err := url.Parse(target)
 			if err != nil {
 				lm.logger.Printf("Error parsing URL %s: %v", target, err)
@@ -193,41 +342,52 @@ func (lm *LightyMux) loadConfig(filename string) error {
 			}
 			proxy := lm.newReverseProxy(nextHop)
 
-			// Apply request/response rules if any
 			if len(route.Rules) > 0 {
 				originalDirector := proxy.Director
 				proxy.Director = func(req *http.Request) {
 					originalDirector(req)
 					for _, rule := range route.Rules {
-						for key, value := range rule.Request.Headers.Add {
-							req.Header.Add(key, value)
+						if rule.Request.Headers.Add != nil {
+							for k, v := range rule.Request.Headers.Add {
+								req.Header.Add(k, v)
+							}
 						}
-						for key, value := range rule.Request.Headers.Set {
-							req.Header.Set(key, value)
+						if rule.Request.Headers.Set != nil {
+							for k, v := range rule.Request.Headers.Set {
+								req.Header.Set(k, v)
+							}
 						}
-						for _, key := range rule.Request.Headers.Del {
-							req.Header.Del(key)
+						if rule.Request.Headers.Del != nil {
+							for _, k := range rule.Request.Headers.Del {
+								req.Header.Del(k)
+							}
 						}
 					}
 				}
 
-				proxy.ModifyResponse = func(res *http.Response) error {
-					if lm.options.LogResponses {
-						dump, err := httputil.DumpResponse(res, true)
-						if err != nil {
+				originalModifyResponse := proxy.ModifyResponse
+				proxy.ModifyResponse = func(resp *http.Response) error {
+					if originalModifyResponse != nil {
+						if err := originalModifyResponse(resp); err != nil {
 							return err
 						}
-						lm.logger.Printf("Response: %s", string(dump))
 					}
+
 					for _, rule := range route.Rules {
-						for key, value := range rule.Response.Headers.Add {
-							res.Header.Add(key, value)
+						if rule.Response.Headers.Add != nil {
+							for k, v := range rule.Response.Headers.Add {
+								resp.Header.Add(k, v)
+							}
 						}
-						for key, value := range rule.Response.Headers.Set {
-							res.Header.Set(key, value)
+						if rule.Response.Headers.Set != nil {
+							for k, v := range rule.Response.Headers.Set {
+								resp.Header.Set(k, v)
+							}
 						}
-						for _, key := range rule.Response.Headers.Del {
-							res.Header.Del(key)
+						if rule.Response.Headers.Del != nil {
+							for _, k := range rule.Response.Headers.Del {
+								resp.Header.Del(k)
+							}
 						}
 					}
 					return nil
@@ -235,9 +395,9 @@ func (lm *LightyMux) loadConfig(filename string) error {
 			}
 
 			newMux.Handle(path, proxy)
-			lm.logger.Printf("Added remote route: %s -> %s", path, nextHop)
+			lm.logger.Printf("Added proxy route: %s -> %s", path, target)
 		} else {
-			// Handle local filesystem path
+			// Check if target is a directory or a file
 			fileInfo, err := os.Stat(target)
 			if err != nil {
 				lm.logger.Printf("Error accessing path %s: %v", target, err)
@@ -245,56 +405,26 @@ func (lm *LightyMux) loadConfig(filename string) error {
 			}
 
 			if fileInfo.IsDir() {
+				// For directories, serve the entire directory
 				fs := http.FileServer(http.Dir(target))
 				newMux.Handle(path, http.StripPrefix(path, fs))
 				lm.logger.Printf("Added directory route: %s -> %s", path, target)
 			} else {
-				fs := http.FileServer(http.Dir(filepath.Dir(target)))
-				newMux.Handle(path, http.StripPrefix(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					r.URL.Path = filepath.Base(target)
-					fs.ServeHTTP(w, r)
-				})))
+				// For single files, serve the file directly
+				newMux.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.ServeFile(w, r, target)
+				}))
 				lm.logger.Printf("Added file route: %s -> %s", path, target)
 			}
 		}
 	}
 
+	// Replace the old mux with the new one atomically
 	lm.muxLock.Lock()
 	lm.mux = newMux
 	lm.muxLock.Unlock()
 
 	return nil
-}
-
-func (lm *LightyMux) watchConfig(filename string) error {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if event.Op&fsnotify.Write == fsnotify.Write {
-					lm.logger.Printf("Config file modified. Reloading...")
-					if err := lm.loadConfig(filename); err != nil {
-						lm.logger.Printf("Error reloading config: %v", err)
-					}
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				lm.logger.Printf("Error watching config file: %v", err)
-			}
-		}
-	}()
-
-	return watcher.Add(filename)
 }
 
 // GetServerAddr returns the current server address in a thread-safe manner
@@ -329,15 +459,12 @@ func singleJoiningSlash(a, b string) string {
 }
 
 func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
-	// Load initial configuration
-	if err := lm.loadConfig(configFile); err != nil {
-		return fmt.Errorf("failed to load config: %v", err)
-	}
-
 	// Watch for config changes
 	if err := lm.watchConfig(configFile); err != nil {
-		return fmt.Errorf("failed to watch config: %v", err)
+		return fmt.Errorf("failed to watch config: %w", err)
 	}
+
+	lm.logger.Printf("Starting server on %s", lm.options.HTTPAddr)
 
 	// Create listener first to get the actual port
 	ln, err := net.Listen("tcp", lm.options.HTTPAddr)
@@ -371,6 +498,12 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 	if err := lm.server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("server shutdown failed: %v", err)
 	}
+
+	defer func() {
+		if lm.reloader != nil {
+			lm.reloader.Close()
+		}
+	}()
 
 	lm.logger.Println("Server gracefully stopped")
 	return nil

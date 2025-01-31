@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"gopkg.in/yaml.v3"
 )
 
@@ -165,11 +166,9 @@ func runProxyTest(t *testing.T, server *httptest.Server, tt struct {
 }
 
 func TestLoadConfig(t *testing.T) {
-	staticDir, files, cleanup := setupTestFiles(t)
+	// Create temporary directory and files
+	staticDir, testFiles, cleanup := setupTestFiles(t)
 	defer cleanup()
-
-	configFile, cleanupConfig := createConfigFile(t, staticDir, files[2].path)
-	defer cleanupConfig()
 
 	// Create a test server that acts as our remote API
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -177,12 +176,12 @@ func TestLoadConfig(t *testing.T) {
 	}))
 	defer apiServer.Close()
 
-	// Update config file with actual API server URL
+	// Create config file with actual API server URL
 	config := LightyConfig{
 		Routes: map[string]RouteConfig{
 			"/api/":    {Target: apiServer.URL},
 			"/static/": {Target: staticDir},
-			"/file":    {Target: files[2].path},
+			"/file":    {Target: testFiles[2].path},
 		},
 	}
 
@@ -191,7 +190,13 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ioutil.WriteFile(configFile, configBytes, 0644); err != nil {
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(configFile.Name())
+
+	if err := os.WriteFile(configFile.Name(), configBytes, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -201,9 +206,32 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatalf("Failed to create LightyMux: %v", err)
 	}
 
-	// Load the config
-	if err := lm.loadConfig(configFile); err != nil {
-		t.Fatalf("Failed to load config: %v", err)
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create a channel to signal when the server is ready
+	serverReady := make(chan struct{})
+	go func() {
+		if err := lm.Run(ctx, configFile.Name()); err != nil && err != context.Canceled {
+			t.Errorf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for the server to be ready
+	for i := 0; i < 50; i++ { // Try for up to 5 seconds
+		if addr := lm.GetServerAddr(); addr != "" {
+			close(serverReady)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	select {
+	case <-serverReady:
+		// Server is ready, continue with the test
+	case <-time.After(5 * time.Second):
+		t.Fatal("Server failed to start within timeout")
 	}
 
 	// Create test server using our mux
@@ -425,7 +453,6 @@ routes:
 			t.Errorf("Server error: %v", err)
 		}
 	}()
-
 	// Wait for the server to be ready by polling the address
 	for i := 0; i < 50; i++ { // Try for up to 5 seconds
 		if addr := lm.GetServerAddr(); addr != "" {
@@ -533,9 +560,8 @@ routes:
 			t.Errorf("Server error: %v", err)
 		}
 	}()
-
 	// Wait for the server to be ready
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 50; i++ { // Try for up to 5 seconds
 		if addr := lm.GetServerAddr(); addr != "" {
 			close(serverReady)
 			break
@@ -627,18 +653,20 @@ func TestConfigFileWatcher(t *testing.T) {
 		mux:     http.NewServeMux(),
 	}
 
-	// Load initial config
-	if err := lm.loadConfig(configPath); err != nil {
-		t.Fatalf("Failed to load initial config: %v", err)
-	}
-
 	// Start config watcher
+	errChan := make(chan error, 1)
 	go func() {
-		if err := lm.watchConfig(configPath); err != nil {
-			t.Errorf("watchConfig failed: %v", err)
-		}
+		errChan <- lm.watchConfig(configPath)
 	}()
 	time.Sleep(100 * time.Millisecond) // Give watcher time to start
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			t.Fatalf("Failed to watch config: %v", err)
+		}
+	default:
+	}
 
 	// Modify config file with new content
 	newConfig := LightyConfig{
@@ -766,5 +794,126 @@ func TestHandleHealthCheck(t *testing.T) {
 	_, err = time.Parse(time.RFC3339, response.Timestamp)
 	if err != nil {
 		t.Errorf("Invalid timestamp format: %v", err)
+	}
+}
+
+func TestRemoteReloader(t *testing.T) {
+	// Create test server
+	testData := []byte("initial config")
+	var serverHits int
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		serverHits++
+		mu.Unlock()
+		w.Write(testData)
+	}))
+	defer server.Close()
+
+	// Test NewRemoteReloader
+	interval := 100 * time.Millisecond
+	reloader2, err := NewConfigReloader(server.URL, interval)
+	reloader, ok := reloader2.(*RemoteReloader)
+	assert.True(t, ok)
+	if err != nil {
+		t.Fatalf("NewRemoteReloader failed: %v", err)
+	}
+
+	if reloader.url != server.URL {
+		t.Errorf("url = %q; want %q", reloader.url, server.URL)
+	}
+	if reloader.interval != interval {
+		t.Errorf("interval = %v; want %v", reloader.interval, interval)
+	}
+
+	// Test Load
+	data, err := reloader.Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if string(data) != string(testData) {
+		t.Errorf("Load() = %q; want %q", string(data), string(testData))
+	}
+
+	// Test Watch
+	var (
+		receivedData []byte
+		receivedErr  error
+		dataReceived bool
+		mu2          sync.Mutex
+	)
+
+	callback := func(data []byte, err error) {
+		mu2.Lock()
+		defer mu2.Unlock()
+		if !dataReceived {
+			receivedData = data
+			receivedErr = err
+			dataReceived = true
+		}
+	}
+
+	if err := reloader.Watch(callback); err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+
+	// Wait for the first callback
+	startTime := time.Now()
+	for {
+		mu2.Lock()
+		if dataReceived || time.Since(startTime) > time.Second {
+			mu2.Unlock()
+			break
+		}
+		mu2.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !dataReceived {
+		t.Fatal("Watch callback was not called within timeout")
+	}
+	if receivedErr != nil {
+		t.Errorf("Watch callback received error: %v", receivedErr)
+	}
+	if string(receivedData) != string(testData) {
+		t.Errorf("Watch callback received data = %q; want %q", string(receivedData), string(testData))
+	}
+
+	// Verify multiple hits to server
+	time.Sleep(interval * 2)
+	mu.Lock()
+	if serverHits < 2 {
+		t.Errorf("server hits = %d; want >= 2", serverHits)
+	}
+	mu.Unlock()
+
+	// Test Close
+	if err := reloader.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+
+	// Verify no more hits after close
+	currentHits := serverHits
+	time.Sleep(interval * 2)
+	mu.Lock()
+	if serverHits != currentHits {
+		t.Errorf("server received hits after Close(): got %d; want %d", serverHits, currentHits)
+	}
+	mu.Unlock()
+}
+
+func TestRemoteReloaderErrors(t *testing.T) {
+	// Test with invalid URL
+	_, err := NewRemoteReloader("invalid-url", time.Second)
+	if err != nil {
+		t.Errorf("NewRemoteReloader with invalid URL returned error: %v", err)
+	}
+
+	// Test with non-existent server
+	reloader, _ := NewRemoteReloader("http://localhost:12345", time.Second)
+	_, err = reloader.Load()
+	if err == nil {
+		t.Error("Load() with non-existent server should return error")
 	}
 }
