@@ -377,8 +377,7 @@ func TestHeaderModification(t *testing.T) {
           header-del:
             - "X-Old-Header"
           header-add:
-            X-New-Header:
-              - "new-value"
+            X-New-Header: "new-value"
           header-set:
             X-Set-Header: "set-value"
 `, backendServer.URL)
@@ -457,18 +456,145 @@ func TestHeaderModification(t *testing.T) {
 	cancel()
 }
 
-func contains(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
-		}
+func TestResponseHeaderModification(t *testing.T) {
+	// Create a test server that will be our backend
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Add some initial headers that we'll modify
+		w.Header().Set("X-Original-Header", "original-value")
+		w.Header().Set("X-Header-To-Delete", "delete-me")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	// Create a temporary config file
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
 	}
-	return false
+	defer os.Remove(configFile.Name())
+
+	// Write test configuration with response header modifications
+	config := fmt.Sprintf(`
+/test:
+  target: %s
+  rules:
+    - response:
+        headers:
+          header-add:
+            X-Added-Header: "added-value"
+          header-set:
+            X-Set-Header: "set-value"
+            X-Original-Header: "modified-value"
+          header-del:
+            - "X-Header-To-Delete"
+`, backendServer.URL)
+
+	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	opts := &Options{
+		HTTPAddr:    "127.0.0.1:0", // Let the system choose a port
+		LogRequests: true,
+	}
+
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create a channel to signal when the server is ready
+	serverReady := make(chan struct{})
+	go func() {
+		if err := lm.Run(ctx, configFile.Name()); err != nil && err != context.Canceled {
+			t.Errorf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for the server to be ready
+	for i := 0; i < 50; i++ {
+		if addr := lm.GetServerAddr(); addr != "" {
+			close(serverReady)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	select {
+	case <-serverReady:
+		// Server is ready, continue with the test
+	case <-time.After(5 * time.Second):
+		t.Fatal("Server failed to start within timeout")
+	}
+
+	// Get the server address
+	serverAddr := lm.GetServerAddr()
+	if serverAddr == "" {
+		t.Fatal("Server address is empty")
+	}
+
+	// Make request to test server
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/test", serverAddr), nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify response status
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status OK, got %v", resp.Status)
+	}
+
+	// Test header modifications
+	tests := []struct {
+		name     string
+		header   string
+		want     []string
+		wantNone bool
+	}{
+		{"Added header with multiple values", "X-Added-Header", []string{"added-value"}, false},
+		{"Set header", "X-Set-Header", []string{"set-value"}, false},
+		{"Modified original header", "X-Original-Header", []string{"modified-value"}, false},
+		{"Deleted header", "X-Header-To-Delete", nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resp.Header.Values(tt.header)
+			if tt.wantNone {
+				if len(got) > 0 {
+					t.Errorf("Header %q should not exist, got %v", tt.header, got)
+				}
+			} else {
+				if !equalStringSlices(got, tt.want) {
+					t.Errorf("Header %q = %v, want %v", tt.header, got, tt.want)
+				}
+			}
+		})
+	}
+
+	// Clean shutdown
+	cancel()
 }
 
-func containsAll(slice []string, items []string) bool {
-	for _, item := range items {
-		if !contains(slice, item) {
+// equalStringSlices compares two string slices for equality
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}

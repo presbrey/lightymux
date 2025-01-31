@@ -51,9 +51,9 @@ type RuleConfig struct {
 
 // HeaderOperations represents the different types of header modifications
 type HeaderOperations struct {
-	Add map[string][]string `yaml:"header-add,omitempty"` // Add values to existing header
-	Set map[string]string   `yaml:"header-set,omitempty"` // Set header to this value, replacing any existing
-	Del []string            `yaml:"header-del,omitempty"` // Delete these headers
+	Add map[string]string `yaml:"header-add,omitempty"` // Add values to existing header
+	Set map[string]string `yaml:"header-set,omitempty"` // Set header to this value, replacing any existing
+	Del []string          `yaml:"header-del,omitempty"` // Delete these headers
 }
 
 // RequestConfig represents request modification rules
@@ -154,10 +154,6 @@ func (lm *LightyMux) newReverseProxy(nextHop *url.URL) *httputil.ReverseProxy {
 		},
 	}
 
-	if lm.options.LogResponses {
-		rp.ModifyResponse = lm.modifyResponse
-	}
-
 	return rp
 }
 
@@ -203,10 +199,8 @@ func (lm *LightyMux) loadConfig(filename string) error {
 				proxy.Director = func(req *http.Request) {
 					originalDirector(req)
 					for _, rule := range route.Rules {
-						for key, values := range rule.Request.Headers.Add {
-							for _, value := range values {
-								req.Header.Add(key, value)
-							}
+						for key, value := range rule.Request.Headers.Add {
+							req.Header.Add(key, value)
 						}
 						for key, value := range rule.Request.Headers.Set {
 							req.Header.Set(key, value)
@@ -217,18 +211,17 @@ func (lm *LightyMux) loadConfig(filename string) error {
 					}
 				}
 
-				originalModifyResponse := proxy.ModifyResponse
 				proxy.ModifyResponse = func(res *http.Response) error {
-					if originalModifyResponse != nil {
-						if err := originalModifyResponse(res); err != nil {
+					if lm.options.LogResponses {
+						dump, err := httputil.DumpResponse(res, true)
+						if err != nil {
 							return err
 						}
+						lm.logger.Printf("Response: %s", string(dump))
 					}
 					for _, rule := range route.Rules {
-						for key, values := range rule.Response.Headers.Add {
-							for _, value := range values {
-								res.Header.Add(key, value)
-							}
+						for key, value := range rule.Response.Headers.Add {
+							res.Header.Add(key, value)
 						}
 						for key, value := range rule.Response.Headers.Set {
 							res.Header.Set(key, value)
@@ -270,17 +263,6 @@ func (lm *LightyMux) loadConfig(filename string) error {
 	lm.mux = newMux
 	lm.muxLock.Unlock()
 
-	return nil
-}
-
-func (lm *LightyMux) modifyResponse(res *http.Response) error {
-	if lm.options.LogResponses {
-		dump, err := httputil.DumpResponse(res, true)
-		if err != nil {
-			return err
-		}
-		lm.logger.Printf("Response: %s", string(dump))
-	}
 	return nil
 }
 
