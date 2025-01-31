@@ -917,3 +917,81 @@ func TestRemoteReloaderErrors(t *testing.T) {
 		t.Error("Load() with non-existent server should return error")
 	}
 }
+
+func TestInitReloaderErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		configPath string
+		wantErr    string
+	}{
+		{
+			name:       "nonexistent config file",
+			configPath: "/nonexistent/config.yaml",
+			wantErr:    "failed to load initial config",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lm := &LightyMux{
+				options: &Options{
+					ConfigRefreshInterval: time.Second,
+				},
+				mux:    http.NewServeMux(),
+				logger: log.New(os.Stderr, "", log.LstdFlags),
+			}
+			err := lm.initReloader(tt.configPath)
+			if err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestProcessConfigErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		wantErr  string
+		setupLM  func(*LightyMux)
+	}{
+		{
+			name:    "invalid yaml",
+			data:    []byte(`invalid: yaml: [`),
+			wantErr: "failed to parse YAML",
+		},
+		{
+			name: "invalid URL target",
+			data: []byte(`
+routes:
+  "/api/":
+    target: "http://[invalid-url"  # Invalid URL syntax
+`),
+			wantErr: "failed to apply config",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := &strings.Builder{}
+			lm := &LightyMux{
+				options: &Options{},
+				mux:     http.NewServeMux(),
+				logger:  log.New(buf, "", log.LstdFlags),
+			}
+			if tt.setupLM != nil {
+				tt.setupLM(lm)
+			}
+			err := lm.processConfig(tt.data)
+			if err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}

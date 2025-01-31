@@ -247,6 +247,13 @@ func (lm *LightyMux) newReverseProxy(nextHop *url.URL) *httputil.ReverseProxy {
 				lm.logger.Printf("Proxying request to: %s", req.URL.String())
 			}
 		},
+		ModifyResponse: func(resp *http.Response) error {
+			if lm.options.LogResponses {
+				lm.logger.Printf("Response from %s: status=%d, headers=%v",
+					resp.Request.URL.String(), resp.StatusCode, resp.Header)
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if lm.options.LogErrors {
 				lm.logger.Printf("Proxy error: %v", err)
@@ -329,15 +336,13 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 	for path, route := range config.Routes {
 		target := route.Target
 		if target == "" {
-			lm.logger.Printf("Skipping route %s: no target specified", path)
-			continue
+			return fmt.Errorf("route %s: no target specified", path)
 		}
 
 		if isWebScheme(target) {
 			nextHop, err := url.Parse(target)
 			if err != nil {
-				lm.logger.Printf("Error parsing URL %s: %v", target, err)
-				continue
+				return fmt.Errorf("route %s: invalid URL %s: %v", path, target, err)
 			}
 			proxy := lm.newReverseProxy(nextHop)
 
@@ -399,8 +404,7 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 			// Check if target is a directory or a file
 			fileInfo, err := os.Stat(target)
 			if err != nil {
-				lm.logger.Printf("Error accessing path %s: %v", target, err)
-				continue
+				return fmt.Errorf("route %s: error accessing path %s: %v", path, target, err)
 			}
 
 			if fileInfo.IsDir() {
