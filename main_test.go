@@ -995,3 +995,94 @@ routes:
 		})
 	}
 }
+
+func TestParseArgs(t *testing.T) {
+	// Save original environment
+	origEnv := os.Environ()
+	defer func() {
+		os.Clearenv()
+		for _, e := range origEnv {
+			parts := strings.SplitN(e, "=", 2)
+			os.Setenv(parts[0], parts[1])
+		}
+	}()
+
+	tests := []struct {
+		name        string
+		args        []string
+		env         map[string]string
+		wantOpts    *Options
+		wantConfig  string
+		wantErrText string
+	}{
+		{
+			name: "valid args and config",
+			args: []string{"-http=:8080", "-verbose", "config.yaml"},
+			env:  map[string]string{},
+			wantOpts: &Options{
+				HTTPAddr:     ":8080",
+				Verbose:     true,
+				LogRequests: false,
+			},
+			wantConfig: "config.yaml",
+		},
+		{
+			name: "environment variables",
+			args: []string{"config.yaml"},
+			env: map[string]string{
+				"HTTP_ADDR":     ":9090",
+				"LOG_REQUESTS":  "true",
+				"LOG_RESPONSES": "true",
+			},
+			wantOpts: &Options{
+				HTTPAddr:      ":9090",
+				LogRequests:  true,
+				LogResponses: true,
+			},
+			wantConfig: "config.yaml",
+		},
+		{
+			name:        "missing config file",
+			args:        []string{"-http=:8080"},
+			env:         map[string]string{},
+			wantErrText: "exactly one config file argument is required",
+		},
+		{
+			name:        "too many arguments",
+			args:        []string{"config1.yaml", "config2.yaml"},
+			env:         map[string]string{},
+			wantErrText: "exactly one config file argument is required",
+		},
+		{
+			name:        "invalid flag",
+			args:        []string{"-invalid-flag", "config.yaml"},
+			env:         map[string]string{},
+			wantErrText: "flag provided but not defined: -invalid-flag",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Clear environment and set test values
+			os.Clearenv()
+			for k, v := range tt.env {
+				os.Setenv(k, v)
+			}
+
+			opts, config, err := parseArgs(tt.args)
+
+			if tt.wantErrText != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrText)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantConfig, config)
+			assert.Equal(t, tt.wantOpts.HTTPAddr, opts.HTTPAddr)
+			assert.Equal(t, tt.wantOpts.Verbose, opts.Verbose)
+			assert.Equal(t, tt.wantOpts.LogRequests, opts.LogRequests)
+			assert.Equal(t, tt.wantOpts.LogResponses, opts.LogResponses)
+		})
+	}
+}

@@ -512,25 +512,38 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 	return nil
 }
 
-func main() {
-	var opts = new(Options)
+// parseConfig parses command line flags and environment variables into Options
+func parseArgs(args []string) (*Options, string, error) {
+	opts := new(Options)
 
-	if err := env.Parse(&opts); err != nil {
-		fmt.Printf("Error parsing env vars: %v\n", err)
-		os.Exit(1)
+	if err := env.Parse(opts); err != nil {
+		return nil, "", fmt.Errorf("error parsing env vars: %w", err)
 	}
 
-	// Allow command line flags to override env vars
-	flag.StringVar(&opts.HTTPAddr, "http", opts.HTTPAddr, "HTTP listen address (e.g., :8080)")
-	flag.BoolVar(&opts.Verbose, "verbose", opts.Verbose, "Enable verbose logging")
-	flag.BoolVar(&opts.LogRequests, "log-requests", opts.LogRequests, "Log incoming requests")
-	flag.BoolVar(&opts.LogResponses, "log-responses", opts.LogResponses, "Log outgoing responses")
-	flag.BoolVar(&opts.LogErrors, "log-errors", opts.LogErrors, "Log proxy errors")
-	flag.StringVar(&opts.LogFile, "log-file", opts.LogFile, "Log to file instead of stderr")
-	flag.Parse()
+	// Create a new FlagSet for testing purposes
+	fs := flag.NewFlagSet("lightymux", flag.ContinueOnError)
+	fs.StringVar(&opts.HTTPAddr, "http", opts.HTTPAddr, "HTTP listen address (e.g., :8080)")
+	fs.BoolVar(&opts.Verbose, "verbose", opts.Verbose, "Enable verbose logging")
+	fs.BoolVar(&opts.LogRequests, "log-requests", opts.LogRequests, "Log incoming requests")
+	fs.BoolVar(&opts.LogResponses, "log-responses", opts.LogResponses, "Log outgoing responses")
+	fs.BoolVar(&opts.LogErrors, "log-errors", opts.LogErrors, "Log proxy errors")
+	fs.StringVar(&opts.LogFile, "log-file", opts.LogFile, "Log to file instead of stderr")
 
-	if flag.NArg() != 1 {
-		fmt.Println("Usage: ./lightymux [flags] <config_file>")
+	if err := fs.Parse(args); err != nil {
+		return nil, "", err
+	}
+
+	if fs.NArg() != 1 {
+		return nil, "", fmt.Errorf("exactly one config file argument is required")
+	}
+
+	return opts, fs.Arg(0), nil
+}
+
+func main() {
+	opts, configFile, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Printf("Error parsing configuration: %v\n", err)
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -541,7 +554,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := lm.Run(context.Background(), flag.Arg(0)); err != nil {
+	if err := lm.Run(context.Background(), configFile); err != nil {
 		fmt.Printf("Error running LightyMux: %v\n", err)
 		os.Exit(1)
 	}
