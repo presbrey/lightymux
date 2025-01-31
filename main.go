@@ -315,6 +315,13 @@ func (lm *LightyMux) watchConfig(filename string) error {
 	return watcher.Add(filename)
 }
 
+// GetServerAddr returns the current server address in a thread-safe manner
+func (lm *LightyMux) GetServerAddr() string {
+	lm.muxLock.RLock()
+	defer lm.muxLock.RUnlock()
+	return lm.server.Addr
+}
+
 // ServeHTTP implements the http.Handler interface
 func (lm *LightyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if lm.options.LogRequests {
@@ -340,10 +347,12 @@ func singleJoiningSlash(a, b string) string {
 }
 
 func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
+	// Load initial configuration
 	if err := lm.loadConfig(configFile); err != nil {
 		return fmt.Errorf("failed to load config: %v", err)
 	}
 
+	// Watch for config changes
 	if err := lm.watchConfig(configFile); err != nil {
 		return fmt.Errorf("failed to watch config: %v", err)
 	}
@@ -355,8 +364,11 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 	}
 
 	// Update server address with actual address
+	lm.muxLock.Lock()
 	lm.server.Addr = ln.Addr().String()
-	lm.logger.Printf("Server started on %s", lm.server.Addr)
+	lm.muxLock.Unlock()
+
+	lm.logger.Printf("Server started on %s", lm.GetServerAddr())
 
 	// Start server in a goroutine
 	go func() {
@@ -370,8 +382,8 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 	lm.logger.Println("Shutting down server...")
 
 	// Create shutdown context with timeout
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
 
 	// Attempt graceful shutdown
 	if err := lm.server.Shutdown(shutdownCtx); err != nil {
