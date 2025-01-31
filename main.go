@@ -37,6 +37,11 @@ type Options struct {
 	RetryAttempts int           `env:"RETRY_ATTEMPTS" envDefault:"3"`
 }
 
+// MuxConfig represents the full YAML configuration
+type LightyConfig struct {
+	Routes map[string]RouteConfig `yaml:"routes"`
+}
+
 // RouteConfig represents a single route configuration
 type RouteConfig struct {
 	Target string       `yaml:"target"`
@@ -49,13 +54,6 @@ type RuleConfig struct {
 	Response ResponseConfig `yaml:"response,omitempty"`
 }
 
-// HeaderOperations represents the different types of header modifications
-type HeaderOperations struct {
-	Add map[string]string `yaml:"header-add,omitempty"` // Add values to existing header
-	Set map[string]string `yaml:"header-set,omitempty"` // Set header to this value, replacing any existing
-	Del []string          `yaml:"header-del,omitempty"` // Delete these headers
-}
-
 // RequestConfig represents request modification rules
 type RequestConfig struct {
 	Headers HeaderOperations `yaml:"headers,omitempty"`
@@ -66,9 +64,11 @@ type ResponseConfig struct {
 	Headers HeaderOperations `yaml:"headers,omitempty"`
 }
 
-// MuxConfig represents the full YAML configuration
-type MuxConfig struct {
-	Routes map[string]RouteConfig `yaml:",inline"`
+// HeaderOperations represents the different types of header modifications
+type HeaderOperations struct {
+	Add map[string]string `yaml:"header-add,omitempty"` // Add values to existing header
+	Set map[string]string `yaml:"header-set,omitempty"` // Set header to this value, replacing any existing
+	Del []string          `yaml:"header-del,omitempty"` // Delete these headers
 }
 
 func isWebScheme(s string) bool {
@@ -170,8 +170,8 @@ func (lm *LightyMux) loadConfig(filename string) error {
 		return fmt.Errorf("failed to read config file: %v", err)
 	}
 
-	var config MuxConfig
-	if err := yaml.Unmarshal(data, &config.Routes); err != nil {
+	var config LightyConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
 		return fmt.Errorf("failed to parse YAML: %v", err)
 	}
 

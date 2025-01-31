@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -10,8 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestIsWebScheme(t *testing.T) {
@@ -89,17 +93,25 @@ func setupTestFiles(t *testing.T) (string, []testFile, func()) {
 }
 
 func createConfigFile(t *testing.T, staticDir, testFile string) (string, func()) {
-	content := fmt.Sprintf(`/api http://api.example.com
-/static/ %s
-/file %s
-`, staticDir, testFile)
+	config := LightyConfig{
+		Routes: map[string]RouteConfig{
+			"/api/":    {Target: "http://api.example.com"},
+			"/static/": {Target: staticDir},
+			"/file":    {Target: testFile},
+		},
+	}
 
-	tmpfile, err := ioutil.TempFile("", "config*.txt")
+	configBytes, err := yaml.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := tmpfile.Write([]byte(content)); err != nil {
+	tmpfile, err := ioutil.TempFile("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tmpfile.Write(configBytes); err != nil {
 		t.Fatal(err)
 	}
 	if err := tmpfile.Close(); err != nil {
@@ -166,15 +178,20 @@ func TestLoadConfig(t *testing.T) {
 	defer apiServer.Close()
 
 	// Update config file with actual API server URL
-	content := fmt.Sprintf(`
-/api:
-  target: %s
-/static/:
-  target: %s
-/file:
-  target: %s
-`, apiServer.URL, staticDir, files[2].path)
-	if err := ioutil.WriteFile(configFile, []byte(content), 0644); err != nil {
+	config := LightyConfig{
+		Routes: map[string]RouteConfig{
+			"/api/":    {Target: apiServer.URL},
+			"/static/": {Target: staticDir},
+			"/file":    {Target: files[2].path},
+		},
+	}
+
+	configBytes, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ioutil.WriteFile(configFile, configBytes, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -369,17 +386,18 @@ func TestHeaderModification(t *testing.T) {
 
 	// Write test configuration
 	config := fmt.Sprintf(`
-/test:
-  target: %s
-  rules:
-    - request:
-        headers:
-          header-del:
-            - "X-Old-Header"
-          header-add:
-            X-New-Header: "new-value"
-          header-set:
-            X-Set-Header: "set-value"
+routes:
+  /test:
+    target: %s
+    rules:
+      - request:
+          headers:
+            header-del:
+              - "X-Old-Header"
+            header-add:
+              X-New-Header: "new-value"
+            header-set:
+              X-Set-Header: "set-value"
 `, backendServer.URL)
 
 	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
@@ -475,18 +493,19 @@ func TestResponseHeaderModification(t *testing.T) {
 
 	// Write test configuration with response header modifications
 	config := fmt.Sprintf(`
-/test:
-  target: %s
-  rules:
-    - response:
-        headers:
-          header-add:
-            X-Added-Header: "added-value"
-          header-set:
-            X-Set-Header: "set-value"
-            X-Original-Header: "modified-value"
-          header-del:
-            - "X-Header-To-Delete"
+routes:
+  /test:
+    target: %s
+    rules:
+      - response:
+          headers:
+            header-add:
+              X-Added-Header: "added-value"
+            header-set:
+              X-Set-Header: "set-value"
+              X-Original-Header: "modified-value"
+            header-del:
+              - "X-Header-To-Delete"
 `, backendServer.URL)
 
 	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
@@ -588,7 +607,106 @@ func TestResponseHeaderModification(t *testing.T) {
 	cancel()
 }
 
-// equalStringSlices compares two string slices for equality
+func TestConfigFileWatcher(t *testing.T) {
+	// Set up test files
+	staticDir, files, cleanup := setupTestFiles(t)
+	defer cleanup()
+
+	// Create initial config file
+	configPath, cleanupConfig := createConfigFile(t, staticDir, files[2].path)
+	defer cleanupConfig()
+
+	// Create a test logger that captures output
+	var logOutput safeLogger
+	testLogger := log.New(&wrappedWriter{sl: &logOutput}, "", 0)
+
+	// Create LightyMux instance with test logger
+	lm := &LightyMux{
+		logger:  testLogger,
+		options: &Options{LogRequests: true, LogResponses: true},
+		mux:     http.NewServeMux(),
+	}
+
+	// Load initial config
+	if err := lm.loadConfig(configPath); err != nil {
+		t.Fatalf("Failed to load initial config: %v", err)
+	}
+
+	// Start config watcher
+	go func() {
+		if err := lm.watchConfig(configPath); err != nil {
+			t.Errorf("watchConfig failed: %v", err)
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // Give watcher time to start
+
+	// Modify config file with new content
+	newConfig := LightyConfig{
+		Routes: map[string]RouteConfig{
+			"/api/":    {Target: "http://newapi.example.com"},
+			"/static/": {Target: staticDir},
+			"/file":    {Target: files[2].path},
+		},
+	}
+
+	newConfigBytes, err := yaml.Marshal(newConfig)
+	if err != nil {
+		t.Fatalf("Failed to marshal new config: %v", err)
+	}
+
+	t.Logf("Writing new config:\n%s", string(newConfigBytes))
+
+	if err := ioutil.WriteFile(configPath, newConfigBytes, 0644); err != nil {
+		t.Fatalf("Failed to modify config file: %v", err)
+	}
+
+	// Give some time for the watcher to detect and process the change
+	time.Sleep(200 * time.Millisecond)
+
+	// Log the captured output
+	t.Logf("Logger output:\n%s", logOutput.String())
+
+	// Verify that config was reloaded
+	if !strings.Contains(logOutput.String(), "Config file modified. Reloading...") {
+		t.Error("Expected log message about config reload not found")
+	}
+
+	// Make a test request to verify the new route
+	req := httptest.NewRequest("GET", "/api/test", nil)
+	rr := httptest.NewRecorder()
+	lm.ServeHTTP(rr, req)
+
+	t.Logf("Response status: %d", rr.Code)
+	t.Logf("Response body: %s", rr.Body.String())
+
+	// The request should be handled by the proxy (even if it fails to connect)
+	// We're mainly checking that the route was updated
+	if rr.Code == http.StatusNotFound {
+		t.Error("Route /api was not updated - got 404 Not Found")
+	}
+}
+
+type safeLogger struct {
+	mu      sync.Mutex
+	builder strings.Builder
+}
+
+type wrappedWriter struct {
+	sl *safeLogger
+}
+
+func (w *wrappedWriter) Write(p []byte) (n int, err error) {
+	w.sl.mu.Lock()
+	defer w.sl.mu.Unlock()
+	return w.sl.builder.Write(p)
+}
+
+func (sl *safeLogger) String() string {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	return sl.builder.String()
+}
+
 func equalStringSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -599,4 +717,54 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestHandleHealthCheck(t *testing.T) {
+	opts := &Options{
+		HTTPAddr: "127.0.0.1:0",
+	}
+
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Create a test request
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+
+	// Call the handler
+	lm.handleHealthCheck(w, req)
+
+	// Check status code
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status code %d, got %d", http.StatusOK, w.Code)
+	}
+
+	// Check Content-Type header
+	contentType := w.Header().Get("Content-Type")
+	if contentType != "application/json" {
+		t.Errorf("Expected Content-Type %q, got %q", "application/json", contentType)
+	}
+
+	// Parse and validate response body
+	var response struct {
+		Status    string `json:"status"`
+		Timestamp string `json:"timestamp"`
+	}
+
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response body: %v", err)
+	}
+
+	// Check status field
+	if response.Status != "healthy" {
+		t.Errorf("Expected status %q, got %q", "healthy", response.Status)
+	}
+
+	// Validate timestamp format
+	_, err = time.Parse(time.RFC3339, response.Timestamp)
+	if err != nil {
+		t.Errorf("Invalid timestamp format: %v", err)
+	}
 }

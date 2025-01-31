@@ -59,21 +59,22 @@ go build
 The configuration file uses YAML format. Each route is defined by its path and target configuration:
 
 ```yaml
-/api:
-  target: http://api.example.com
-  rules:
-    - request:
-        headers:
-          X-API-Key: secret-key
-    - response:
-        headers:
-          Access-Control-Allow-Origin: "*"
+routes:
+  /api:
+    target: http://api.example.com
+    rules:
+      - request:
+          headers:
+            X-API-Key: secret-key
+      - response:
+          headers:
+            Access-Control-Allow-Origin: "*"
 
-/static:
-  target: /var/www/static
+  /static:
+    target: /var/www/static
 
-/files:
-  target: /path/to/files
+  /files:
+    target: /path/to/files
 ```
 
 Routes can be configured for:
