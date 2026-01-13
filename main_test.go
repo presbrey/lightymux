@@ -309,6 +309,7 @@ func TestLoadConfig(t *testing.T) {
 
 	// Create config file with actual API server URL
 	config := LightyConfig{
+		Port: 0, // Let system pick a random port
 		Routes: map[string]RouteConfig{
 			"/api/":    {Target: apiServer.URL},
 			"/static/": {Target: staticDir},
@@ -1126,15 +1127,17 @@ func TestHealthRouteRegistration(t *testing.T) {
 	}
 	defer os.Remove(configFile.Name())
 
-	// Write minimal config
-	config := `routes: {}`
+	// Write config with health route
+	config := `
+health: /health
+routes: {}
+`
 	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
 	}
 
 	opts := &Options{
-		HTTPAddr:    "127.0.0.1:0",
-		HealthRoute: "/health",
+		HTTPAddr: "127.0.0.1:0",
 	}
 
 	lm, err := NewLightyMux(opts)

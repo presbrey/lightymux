@@ -33,12 +33,14 @@ type Options struct {
 	LogResponses          bool          `env:"LOG_RESPONSES" envDefault:"false"`
 	LogErrors             bool          `env:"LOG_ERRORS" envDefault:"true"`
 	LogFile               string        `env:"LOG_FILE" envDefault:""`
-	HealthRoute           string        `env:"HEALTH_ROUTE" envDefault:""`
 }
 
 // MuxConfig represents the full YAML configuration
 type LightyConfig struct {
-	Routes map[string]RouteConfig `yaml:"routes"`
+	Listen      string                 `yaml:"listen,omitempty"` // Listen address (e.g., "0.0.0.0")
+	Port        int                    `yaml:"port,omitempty"`   // Port to listen on
+	HealthRoute string                 `yaml:"health,omitempty"` // Health check route path
+	Routes      map[string]RouteConfig `yaml:"routes"`
 }
 
 // RouteConfig represents a single route configuration
@@ -219,6 +221,7 @@ func NewConfigReloader(path string, refreshInterval time.Duration) (ConfigReload
 // LightyMux is the main application struct that coordinates all components
 type LightyMux struct {
 	options  *Options
+	config   *LightyConfig // Current config (updated on reload)
 	logger   *log.Logger
 	server   *http.Server
 	routes   sync.Map // map[string]http.Handler
@@ -328,6 +331,9 @@ func (lm *LightyMux) processConfig(data []byte) error {
 		return fmt.Errorf("failed to apply config: %v", err)
 	}
 
+	// Store config for server binding updates
+	lm.config = &config
+
 	return nil
 }
 
@@ -352,10 +358,10 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 	// Track which keys we're keeping
 	newKeys := make(map[string]bool)
 
-	// Add health check endpoint only if HealthRoute is non-blank
-	if lm.options.HealthRoute != "" {
-		lm.routes.Store(lm.options.HealthRoute, http.HandlerFunc(lm.handleHealthCheck))
-		newKeys[lm.options.HealthRoute] = true
+	// Add health check endpoint from config
+	if config.HealthRoute != "" {
+		lm.routes.Store(config.HealthRoute, http.HandlerFunc(lm.handleHealthCheck))
+		newKeys[config.HealthRoute] = true
 	}
 
 	// Log the config reload
@@ -555,17 +561,20 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 		return fmt.Errorf("failed to watch config: %w", err)
 	}
 
-	lm.logger.Printf("Starting server on %s", lm.options.HTTPAddr)
+	// Build address to listen on
+	addr := lm.buildListenAddr()
+	if addr == "" {
+		return fmt.Errorf("no listen address configured")
+	}
 
-	// Create listener first to get the actual port
-	ln, err := net.Listen("tcp", lm.options.HTTPAddr)
+	// Create listener
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("failed to create listener: %v", err)
+		return fmt.Errorf("failed to create listener on %s: %v", addr, err)
 	}
 
 	// Update server address with actual address
 	lm.server.Addr = ln.Addr().String()
-
 	lm.logger.Printf("Server started on %s", lm.GetServerAddr())
 
 	// Start server in a goroutine
@@ -596,6 +605,23 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 
 	lm.logger.Println("Server gracefully stopped")
 	return nil
+}
+
+// buildListenAddr builds the address to listen on from config and options
+func (lm *LightyMux) buildListenAddr() string {
+	// Use config values if available
+	if lm.config != nil {
+		listen := lm.config.Listen
+		if listen == "" {
+			listen = "0.0.0.0"
+		}
+
+		// Port from config (0 means random port)
+		return fmt.Sprintf("%s:%d", listen, lm.config.Port)
+	}
+
+	// Fall back to options.HTTPAddr
+	return lm.options.HTTPAddr
 }
 
 // parseConfig parses command line flags and environment variables into Options

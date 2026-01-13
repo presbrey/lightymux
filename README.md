@@ -41,7 +41,7 @@ go build
 
 ### Environment Variables
 
-- `HTTP_ADDR`: HTTP listen address (default: "")
+- `HTTP_ADDR`: HTTP listen address (default: ""), fallback if not in config file
 - `READ_TIMEOUT`: Read timeout duration (default: 30s)
 - `WRITE_TIMEOUT`: Write timeout duration (default: 30s)
 - `IDLE_TIMEOUT`: Idle timeout duration (default: 60s)
@@ -51,13 +51,18 @@ go build
 - `LOG_RESPONSES`: Log outgoing responses (default: false)
 - `LOG_ERRORS`: Log proxy errors (default: true)
 - `LOG_FILE`: Log to file instead of stderr
-- `HEALTH_ROUTE`: Health check route path (default: "/health")
 
 ### Configuration File Format
 
-The configuration file uses YAML format. Each route is defined by its path and target configuration:
+The configuration file uses YAML format with top-level server settings and routes:
 
 ```yaml
+# Server settings
+listen: 0.0.0.0      # Bind address (default: 0.0.0.0)
+port: 8080           # Port to listen on
+health: /health      # Health check endpoint path
+
+# Routes
 routes:
   /api:
     target: http://api.example.com
