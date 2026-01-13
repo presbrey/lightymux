@@ -76,6 +76,31 @@ routes:
     target: /path/to/files
 ```
 
+#### Hostname-Based Routing
+
+Routes can include a hostname prefix to route traffic based on the `Host` header:
+
+```yaml
+routes:
+  # Host-specific routes (matched first)
+  api.example.com/v1/:
+    target: http://api-v1-backend:8080
+  api.example.com/v2/:
+    target: http://api-v2-backend:8080
+  
+  # Wildcard route (fallback for any host)
+  /api/:
+    target: http://default-backend:8080
+```
+
+Route format: `hostname/path` or just `/path` for wildcard (all hosts).
+
+Priority order:
+1. Host-specific exact match (`api.example.com/users`)
+2. Host-specific prefix match (`api.example.com/users/`)
+3. Wildcard exact match (`/users`)
+4. Wildcard prefix match (`/users/`)
+
 Routes can be configured for:
 - Remote HTTP/HTTPS endpoints
 - Local directories (static file serving)

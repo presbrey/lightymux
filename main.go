@@ -74,6 +74,34 @@ func isWebScheme(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
+// parseRouteKey parses a route key into (host, path) components.
+// Format: "hostname/path" or just "/path" for wildcard host.
+// Examples:
+//   - "example.com/api/" -> ("example.com", "/api/")
+//   - "/api/" -> ("", "/api/")
+//   - "example.com/" -> ("example.com", "/")
+func parseRouteKey(key string) (host, path string) {
+	if strings.HasPrefix(key, "/") {
+		// No hostname, just a path
+		return "", key
+	}
+	// Find the first slash to separate host from path
+	idx := strings.Index(key, "/")
+	if idx == -1 {
+		// No path, treat as host with root path
+		return key, "/"
+	}
+	return key[:idx], key[idx:]
+}
+
+// makeRouteKey creates a route key from host and path components.
+func makeRouteKey(host, path string) string {
+	if host == "" {
+		return path
+	}
+	return host + path
+}
+
 // ConfigReloader is an interface for loading and watching configuration
 type ConfigReloader interface {
 	Load() ([]byte, error)
@@ -448,26 +476,55 @@ func (lm *LightyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find the best matching route
-	path := r.URL.Path
-	var handler http.Handler
-	var matchedPath string
+	// Priority: host-specific exact > host-specific prefix > wildcard exact > wildcard prefix
+	reqPath := r.URL.Path
+	reqHost := r.Host
+	// Strip port from host if present
+	if idx := strings.LastIndex(reqHost, ":"); idx != -1 {
+		reqHost = reqHost[:idx]
+	}
 
-	// First try exact match
-	if h, ok := lm.routes.Load(path); ok {
+	var handler http.Handler
+	var matchedLen int
+
+	// Try host-specific exact match first
+	hostKey := makeRouteKey(reqHost, reqPath)
+	if h, ok := lm.routes.Load(hostKey); ok {
 		handler = h.(http.Handler)
-		matchedPath = path
-	} else {
-		// Try prefix matching (longest match wins)
+		matchedLen = len(hostKey)
+	}
+
+	// Try wildcard exact match
+	if handler == nil {
+		if h, ok := lm.routes.Load(reqPath); ok {
+			handler = h.(http.Handler)
+			matchedLen = len(reqPath)
+		}
+	}
+
+	// Try prefix matching (longest match wins)
+	if handler == nil {
 		lm.routes.Range(func(key, value any) bool {
-			p := key.(string)
-			if strings.HasSuffix(p, "/") {
-				// Match if path starts with route prefix, or path is the prefix minus trailing slash
-				if strings.HasPrefix(path, p) || path+"/" == p {
-					if len(p) > len(matchedPath) {
-						matchedPath = p
-						handler = value.(http.Handler)
-					}
+			routeKey := key.(string)
+			routeHost, routePath := parseRouteKey(routeKey)
+
+			// Check if route matches
+			var matches bool
+			if routeHost != "" {
+				// Host-specific route
+				if routeHost == reqHost && strings.HasSuffix(routePath, "/") {
+					matches = strings.HasPrefix(reqPath, routePath) || reqPath+"/" == routePath
 				}
+			} else {
+				// Wildcard route
+				if strings.HasSuffix(routePath, "/") {
+					matches = strings.HasPrefix(reqPath, routePath) || reqPath+"/" == routePath
+				}
+			}
+
+			if matches && len(routeKey) > matchedLen {
+				matchedLen = len(routeKey)
+				handler = value.(http.Handler)
 			}
 			return true
 		})

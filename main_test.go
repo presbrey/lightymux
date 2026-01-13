@@ -58,6 +58,137 @@ func TestSingleJoiningSlash(t *testing.T) {
 	}
 }
 
+func TestParseRouteKey(t *testing.T) {
+	tests := []struct {
+		key      string
+		wantHost string
+		wantPath string
+	}{
+		{"/api/", "", "/api/"},
+		{"/", "", "/"},
+		{"example.com/api/", "example.com", "/api/"},
+		{"example.com/", "example.com", "/"},
+		{"example.com", "example.com", "/"},
+		{"api.example.com/v1/users", "api.example.com", "/v1/users"},
+	}
+
+	for _, tt := range tests {
+		host, path := parseRouteKey(tt.key)
+		if host != tt.wantHost || path != tt.wantPath {
+			t.Errorf("parseRouteKey(%q) = (%q, %q); want (%q, %q)",
+				tt.key, host, path, tt.wantHost, tt.wantPath)
+		}
+	}
+}
+
+func TestMakeRouteKey(t *testing.T) {
+	tests := []struct {
+		host string
+		path string
+		want string
+	}{
+		{"", "/api/", "/api/"},
+		{"example.com", "/api/", "example.com/api/"},
+		{"example.com", "/", "example.com/"},
+	}
+
+	for _, tt := range tests {
+		got := makeRouteKey(tt.host, tt.path)
+		if got != tt.want {
+			t.Errorf("makeRouteKey(%q, %q) = %q; want %q",
+				tt.host, tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestHostnameBasedRouting(t *testing.T) {
+	// Create backend servers for different hosts
+	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Backend A"))
+	}))
+	defer backendA.Close()
+
+	backendB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Backend B"))
+	}))
+	defer backendB.Close()
+
+	backendDefault := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Default Backend"))
+	}))
+	defer backendDefault.Close()
+
+	// Create config with hostname-based routes
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(configFile.Name())
+
+	config := fmt.Sprintf(`
+routes:
+  a.example.com/api/:
+    target: %s
+  b.example.com/api/:
+    target: %s
+  /api/:
+    target: %s
+`, backendA.URL, backendB.URL, backendDefault.URL)
+
+	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &Options{HTTPAddr: "127.0.0.1:0"}
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go lm.Run(ctx, configFile.Name())
+
+	// Wait for server
+	for i := 0; i < 50; i++ {
+		if lm.GetServerAddr() != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	serverAddr := lm.GetServerAddr()
+
+	tests := []struct {
+		name     string
+		host     string
+		wantBody string
+	}{
+		{"Host A routes to Backend A", "a.example.com", "Backend A"},
+		{"Host B routes to Backend B", "b.example.com", "Backend B"},
+		{"Unknown host routes to default", "unknown.example.com", "Default Backend"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/api/test", serverAddr), nil)
+			req.Host = tt.host
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			body, _ := ioutil.ReadAll(resp.Body)
+			if !strings.Contains(string(body), tt.wantBody) {
+				t.Errorf("Got body %q, want %q", string(body), tt.wantBody)
+			}
+		})
+	}
+}
+
 type testFile struct {
 	path    string
 	content string
