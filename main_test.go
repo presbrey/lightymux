@@ -424,14 +424,7 @@ func TestNewLightyMux(t *testing.T) {
 				HTTPAddr: ":8080",
 			},
 		},
-		{
-			name: "With logging options",
-			opts: &Options{
-				LogFile:      "test.log",
-				LogRequests:  true,
-				LogResponses: true,
-			},
-		},
+
 		{
 			name: "Zero timeouts disable timeouts",
 			opts: &Options{
@@ -492,8 +485,7 @@ func TestLightyMuxRun(t *testing.T) {
 
 	// Create LightyMux with test options
 	opts := &Options{
-		HTTPAddr:    ":0", // Use random port
-		LogRequests: true,
+		HTTPAddr: ":0", // Use random port
 	}
 
 	lm, err := NewLightyMux(opts)
@@ -570,8 +562,7 @@ routes:
 	}
 
 	opts := &Options{
-		HTTPAddr:    "127.0.0.1:0", // Let the system choose a port
-		LogRequests: true,
+		HTTPAddr: "127.0.0.1:0", // Let the system choose a port
 	}
 
 	lm, err := NewLightyMux(opts)
@@ -677,8 +668,7 @@ routes:
 	}
 
 	opts := &Options{
-		HTTPAddr:    "127.0.0.1:0", // Let the system choose a port
-		LogRequests: true,
+		HTTPAddr: "127.0.0.1:0", // Let the system choose a port
 	}
 
 	lm, err := NewLightyMux(opts)
@@ -784,9 +774,11 @@ func TestConfigFileWatcher(t *testing.T) {
 	testLogger := log.New(&wrappedWriter{sl: &logOutput}, "", 0)
 
 	// Create LightyMux instance with test logger
+	// Create LightyMux instance with test logger
 	lm := &LightyMux{
 		logger:  testLogger,
-		options: &Options{LogRequests: true, LogResponses: true},
+		options: &Options{},
+		config:  &LightyConfig{Log: LogConfig{Requests: true, Responses: true}},
 	}
 
 	// Start config watcher
@@ -1065,7 +1057,10 @@ func TestVerboseProxyLogging(t *testing.T) {
 	defer os.Remove(configFile.Name())
 
 	// Write test configuration
+	// Write test configuration
 	config := fmt.Sprintf(`
+log:
+  verbose: true
 routes:
   /test:
     target: %s
@@ -1077,7 +1072,6 @@ routes:
 
 	opts := &Options{
 		HTTPAddr: "127.0.0.1:0",
-		Verbose:  true, // Enable verbose logging
 	}
 
 	lm, err := NewLightyMux(opts)
@@ -1189,6 +1183,8 @@ func TestProxyErrorHandler(t *testing.T) {
 
 	// Point to a port that's not listening
 	config := `
+log:
+  errors: true
 routes:
   /test:
     target: http://127.0.0.1:19999
@@ -1198,8 +1194,7 @@ routes:
 	}
 
 	opts := &Options{
-		HTTPAddr:  "127.0.0.1:0",
-		LogErrors: true,
+		HTTPAddr: "127.0.0.1:0",
 	}
 
 	lm, err := NewLightyMux(opts)
@@ -1354,12 +1349,10 @@ func TestParseArgs(t *testing.T) {
 	}{
 		{
 			name: "valid args and config",
-			args: []string{"-http=:8080", "-verbose", "config.yaml"},
+			args: []string{"-http=:8080", "config.yaml"},
 			env:  map[string]string{},
 			wantOpts: &Options{
-				HTTPAddr:    ":8080",
-				Verbose:     true,
-				LogRequests: false,
+				HTTPAddr: ":8080",
 			},
 			wantConfig: "config.yaml",
 		},
@@ -1367,14 +1360,10 @@ func TestParseArgs(t *testing.T) {
 			name: "environment variables",
 			args: []string{"config.yaml"},
 			env: map[string]string{
-				"HTTP_ADDR":     ":9090",
-				"LOG_REQUESTS":  "true",
-				"LOG_RESPONSES": "true",
+				"HTTP_ADDR": ":9090",
 			},
 			wantOpts: &Options{
-				HTTPAddr:     ":9090",
-				LogRequests:  true,
-				LogResponses: true,
+				HTTPAddr: ":9090",
 			},
 			wantConfig: "config.yaml",
 		},
@@ -1417,9 +1406,6 @@ func TestParseArgs(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, tt.wantConfig, config)
 			assert.Equal(t, tt.wantOpts.HTTPAddr, opts.HTTPAddr)
-			assert.Equal(t, tt.wantOpts.Verbose, opts.Verbose)
-			assert.Equal(t, tt.wantOpts.LogRequests, opts.LogRequests)
-			assert.Equal(t, tt.wantOpts.LogResponses, opts.LogResponses)
 		})
 	}
 }

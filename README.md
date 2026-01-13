@@ -46,11 +46,6 @@ go build
 - `WRITE_TIMEOUT`: Write timeout duration (default: 30s)
 - `IDLE_TIMEOUT`: Idle timeout duration (default: 60s)
 - `PROXY_TIMEOUT`: Proxy timeout duration (default: 60s)
-- `VERBOSE`: Enable verbose logging (default: false)
-- `LOG_REQUESTS`: Log incoming requests (default: false)
-- `LOG_RESPONSES`: Log outgoing responses (default: false)
-- `LOG_ERRORS`: Log proxy errors (default: true)
-- `LOG_FILE`: Log to file instead of stderr
 
 ### Configuration File Format
 
@@ -61,6 +56,14 @@ The configuration file uses YAML format with top-level server settings and route
 listen: 0.0.0.0      # Bind address (default: 0.0.0.0)
 port: 8080           # Port to listen on
 health: /health      # Health check endpoint path
+
+# Logging settings
+log:
+  requests: true     # Log incoming requests (default: false)
+  responses: false   # Log outgoing responses (default: false)
+  errors: true       # Log proxy errors (default: true)
+  verbose: false     # Enable verbose logging (default: false)
+  file: ""           # Log to file instead of stderr
 
 # Routes
 routes:

@@ -20,7 +20,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Options holds the application configuration
+// Options holds the application configuration (env vars and flags)
 type Options struct {
 	HTTPAddr              string        `env:"HTTP_ADDR" envDefault:""`
 	ReadTimeout           time.Duration `env:"READ_TIMEOUT" envDefault:"30s"`
@@ -28,11 +28,15 @@ type Options struct {
 	IdleTimeout           time.Duration `env:"IDLE_TIMEOUT" envDefault:"60s"`
 	ProxyTimeout          time.Duration `env:"PROXY_TIMEOUT" envDefault:"60s"`
 	ConfigRefreshInterval time.Duration `env:"CONFIG_REFRESH_INTERVAL" envDefault:"1m"`
-	Verbose               bool          `env:"VERBOSE" envDefault:"false"`
-	LogRequests           bool          `env:"LOG_REQUESTS" envDefault:"false"`
-	LogResponses          bool          `env:"LOG_RESPONSES" envDefault:"false"`
-	LogErrors             bool          `env:"LOG_ERRORS" envDefault:"true"`
-	LogFile               string        `env:"LOG_FILE" envDefault:""`
+}
+
+// LogConfig represents logging configuration in YAML
+type LogConfig struct {
+	Requests  bool   `yaml:"requests,omitempty"`  // Log incoming requests
+	Responses bool   `yaml:"responses,omitempty"` // Log outgoing responses
+	Errors    bool   `yaml:"errors,omitempty"`    // Log proxy errors
+	Verbose   bool   `yaml:"verbose,omitempty"`   // Enable verbose logging
+	File      string `yaml:"file,omitempty"`      // Log to file instead of stdout
 }
 
 // MuxConfig represents the full YAML configuration
@@ -40,6 +44,7 @@ type LightyConfig struct {
 	Listen      string                 `yaml:"listen,omitempty"` // Listen address (e.g., "0.0.0.0")
 	Port        int                    `yaml:"port,omitempty"`   // Port to listen on
 	HealthRoute string                 `yaml:"health,omitempty"` // Health check route path
+	Log         LogConfig              `yaml:"log,omitempty"`    // Logging configuration
 	Routes      map[string]RouteConfig `yaml:"routes"`
 }
 
@@ -234,19 +239,9 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 		return nil, fmt.Errorf("options cannot be nil")
 	}
 
-	// Configure logging
-	var logWriter io.Writer = os.Stdout
-	if opts.LogFile != "" {
-		file, err := os.OpenFile(opts.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open log file: %v", err)
-		}
-		logWriter = file
-	}
-
 	l := &LightyMux{
 		options: opts,
-		logger:  log.New(logWriter, "", log.LstdFlags),
+		logger:  log.New(os.Stdout, "", log.LstdFlags),
 	}
 
 	// Set up HTTP server with timeouts
@@ -272,19 +267,19 @@ func (lm *LightyMux) newReverseProxy(nextHop *url.URL) *httputil.ReverseProxy {
 			req.URL.Scheme = nextHop.Scheme
 			req.URL.Host = nextHop.Host
 			req.URL.Path = singleJoiningSlash(nextHop.Path, req.URL.Path)
-			if lm.options.Verbose {
+			if lm.config != nil && lm.config.Log.Verbose {
 				lm.logger.Printf("Proxying request to: %s", req.URL.String())
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			if lm.options.LogResponses {
+			if lm.config != nil && lm.config.Log.Responses {
 				lm.logger.Printf("Response from %s: status=%d, headers=%v",
 					resp.Request.URL.String(), resp.StatusCode, resp.Header)
 			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if lm.options.LogErrors {
+			if lm.config != nil && lm.config.Log.Errors {
 				lm.logger.Printf("Proxy error: %v", err)
 			}
 			w.WriteHeader(http.StatusBadGateway)
@@ -476,7 +471,7 @@ func (lm *LightyMux) GetServerAddr() string {
 
 // ServeHTTP implements the http.Handler interface
 func (lm *LightyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if lm.options.LogRequests {
+	if lm.config != nil && lm.config.Log.Requests {
 		dump, _ := httputil.DumpRequest(r, true)
 		lm.logger.Printf("Request: %s", string(dump))
 	}
@@ -635,11 +630,6 @@ func parseArgs(args []string) (*Options, string, error) {
 	// Create a new FlagSet for testing purposes
 	fs := flag.NewFlagSet("lightymux", flag.ContinueOnError)
 	fs.StringVar(&opts.HTTPAddr, "http", opts.HTTPAddr, "HTTP listen address (e.g., :8080)")
-	fs.BoolVar(&opts.Verbose, "verbose", opts.Verbose, "Enable verbose logging")
-	fs.BoolVar(&opts.LogRequests, "log-requests", opts.LogRequests, "Log incoming requests")
-	fs.BoolVar(&opts.LogResponses, "log-responses", opts.LogResponses, "Log outgoing responses")
-	fs.BoolVar(&opts.LogErrors, "log-errors", opts.LogErrors, "Log proxy errors")
-	fs.StringVar(&opts.LogFile, "log-file", opts.LogFile, "Log to file instead of stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, "", err
