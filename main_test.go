@@ -308,6 +308,11 @@ func TestNewLightyMux(t *testing.T) {
 				IdleTimeout:  0,
 			},
 		},
+		{
+			name:    "Nil options returns error",
+			opts:    nil,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -650,7 +655,6 @@ func TestConfigFileWatcher(t *testing.T) {
 	lm := &LightyMux{
 		logger:  testLogger,
 		options: &Options{LogRequests: true, LogResponses: true},
-		mux:     http.NewServeMux(),
 	}
 
 	// Start config watcher
@@ -903,6 +907,144 @@ func TestRemoteReloader(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestLocalReloaderCloseNilWatcher(t *testing.T) {
+	// Test Close with nil watcher (no Watch called)
+	reloader, err := NewLocalReloader("/tmp/test.yaml")
+	assert.NoError(t, err)
+
+	// Close without calling Watch should not panic
+	err = reloader.Close()
+	assert.NoError(t, err)
+}
+
+func TestVerboseProxyLogging(t *testing.T) {
+	// Create a test server that will be our backend
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	}))
+	defer backendServer.Close()
+
+	// Create a temporary config file
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(configFile.Name())
+
+	// Write test configuration
+	config := fmt.Sprintf(`
+routes:
+  /test:
+    target: %s
+`, backendServer.URL)
+
+	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	opts := &Options{
+		HTTPAddr: "127.0.0.1:0",
+		Verbose:  true, // Enable verbose logging
+	}
+
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := lm.Run(ctx, configFile.Name()); err != nil && err != context.Canceled {
+			t.Errorf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for server to be ready
+	for i := 0; i < 50; i++ {
+		if addr := lm.GetServerAddr(); addr != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	serverAddr := lm.GetServerAddr()
+	if serverAddr == "" {
+		t.Fatal("Server address is empty")
+	}
+
+	// Make request to trigger verbose logging
+	resp, err := http.Get(fmt.Sprintf("http://%s/test", serverAddr))
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	cancel()
+}
+
+func TestHealthRouteRegistration(t *testing.T) {
+	// Create a temporary config file
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(configFile.Name())
+
+	// Write minimal config
+	config := `routes: {}`
+	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	opts := &Options{
+		HTTPAddr:    "127.0.0.1:0",
+		HealthRoute: "/health",
+	}
+
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := lm.Run(ctx, configFile.Name()); err != nil && err != context.Canceled {
+			t.Errorf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for server to be ready
+	for i := 0; i < 50; i++ {
+		if addr := lm.GetServerAddr(); addr != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	serverAddr := lm.GetServerAddr()
+	if serverAddr == "" {
+		t.Fatal("Server address is empty")
+	}
+
+	// Make request to health endpoint
+	resp, err := http.Get(fmt.Sprintf("http://%s/health", serverAddr))
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	cancel()
+}
+
 func TestRemoteReloaderErrors(t *testing.T) {
 	// Test with invalid URL
 	_, err := NewRemoteReloader("invalid-url", time.Second)
@@ -937,7 +1079,6 @@ func TestInitReloaderErrors(t *testing.T) {
 				options: &Options{
 					ConfigRefreshInterval: time.Second,
 				},
-				mux:    http.NewServeMux(),
 				logger: log.New(os.Stderr, "", log.LstdFlags),
 			}
 			err := lm.initReloader(tt.configPath)
@@ -953,10 +1094,10 @@ func TestInitReloaderErrors(t *testing.T) {
 
 func TestProcessConfigErrors(t *testing.T) {
 	tests := []struct {
-		name     string
-		data     []byte
-		wantErr  string
-		setupLM  func(*LightyMux)
+		name    string
+		data    []byte
+		wantErr string
+		setupLM func(*LightyMux)
 	}{
 		{
 			name:    "invalid yaml",
@@ -979,7 +1120,6 @@ routes:
 			buf := &strings.Builder{}
 			lm := &LightyMux{
 				options: &Options{},
-				mux:     http.NewServeMux(),
 				logger:  log.New(buf, "", log.LstdFlags),
 			}
 			if tt.setupLM != nil {
@@ -1020,7 +1160,7 @@ func TestParseArgs(t *testing.T) {
 			args: []string{"-http=:8080", "-verbose", "config.yaml"},
 			env:  map[string]string{},
 			wantOpts: &Options{
-				HTTPAddr:     ":8080",
+				HTTPAddr:    ":8080",
 				Verbose:     true,
 				LogRequests: false,
 			},
@@ -1035,7 +1175,7 @@ func TestParseArgs(t *testing.T) {
 				"LOG_RESPONSES": "true",
 			},
 			wantOpts: &Options{
-				HTTPAddr:      ":9090",
+				HTTPAddr:     ":9090",
 				LogRequests:  true,
 				LogResponses: true,
 			},

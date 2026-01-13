@@ -193,8 +193,7 @@ type LightyMux struct {
 	options  *Options
 	logger   *log.Logger
 	server   *http.Server
-	mux      *http.ServeMux
-	muxLock  sync.RWMutex
+	routes   sync.Map // map[string]http.Handler
 	reloader ConfigReloader
 }
 
@@ -217,7 +216,6 @@ func NewLightyMux(opts *Options) (*LightyMux, error) {
 	l := &LightyMux{
 		options: opts,
 		logger:  log.New(logWriter, "", log.LstdFlags),
-		muxLock: sync.RWMutex{},
 	}
 
 	// Set up HTTP server with timeouts
@@ -323,11 +321,13 @@ func (lm *LightyMux) watchConfig(configPath string) error {
 }
 
 func (lm *LightyMux) applyConfig(config *LightyConfig) error {
-	newMux := http.NewServeMux()
+	// Track which keys we're keeping
+	newKeys := make(map[string]bool)
 
 	// Add health check endpoint only if HealthRoute is non-blank
 	if lm.options.HealthRoute != "" {
-		newMux.HandleFunc(lm.options.HealthRoute, lm.handleHealthCheck)
+		lm.routes.Store(lm.options.HealthRoute, http.HandlerFunc(lm.handleHealthCheck))
+		newKeys[lm.options.HealthRoute] = true
 	}
 
 	// Log the config reload
@@ -338,6 +338,8 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 		if target == "" {
 			return fmt.Errorf("route %s: no target specified", path)
 		}
+
+		newKeys[path] = true
 
 		if isWebScheme(target) {
 			nextHop, err := url.Parse(target)
@@ -398,7 +400,7 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 				}
 			}
 
-			newMux.Handle(path, proxy)
+			lm.routes.Store(path, proxy)
 			lm.logger.Printf("Added proxy route: %s -> %s", path, target)
 		} else {
 			// Check if target is a directory or a file
@@ -410,11 +412,11 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 			if fileInfo.IsDir() {
 				// For directories, serve the entire directory
 				fs := http.FileServer(http.Dir(target))
-				newMux.Handle(path, http.StripPrefix(path, fs))
+				lm.routes.Store(path, http.StripPrefix(path, fs))
 				lm.logger.Printf("Added directory route: %s -> %s", path, target)
 			} else {
 				// For single files, serve the file directly
-				newMux.Handle(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				lm.routes.Store(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					http.ServeFile(w, r, target)
 				}))
 				lm.logger.Printf("Added file route: %s -> %s", path, target)
@@ -422,18 +424,19 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 		}
 	}
 
-	// Replace the old mux with the new one atomically
-	lm.muxLock.Lock()
-	lm.mux = newMux
-	lm.muxLock.Unlock()
+	// Delete routes that no longer exist
+	lm.routes.Range(func(key, value any) bool {
+		if !newKeys[key.(string)] {
+			lm.routes.Delete(key)
+		}
+		return true
+	})
 
 	return nil
 }
 
-// GetServerAddr returns the current server address in a thread-safe manner
+// GetServerAddr returns the current server address
 func (lm *LightyMux) GetServerAddr() string {
-	lm.muxLock.RLock()
-	defer lm.muxLock.RUnlock()
 	return lm.server.Addr
 }
 
@@ -443,10 +446,38 @@ func (lm *LightyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		dump, _ := httputil.DumpRequest(r, true)
 		lm.logger.Printf("Request: %s", string(dump))
 	}
-	lm.muxLock.RLock()
-	mux := lm.mux
-	lm.muxLock.RUnlock()
-	mux.ServeHTTP(w, r)
+
+	// Find the best matching route
+	path := r.URL.Path
+	var handler http.Handler
+	var matchedPath string
+
+	// First try exact match
+	if h, ok := lm.routes.Load(path); ok {
+		handler = h.(http.Handler)
+		matchedPath = path
+	} else {
+		// Try prefix matching (longest match wins)
+		lm.routes.Range(func(key, value any) bool {
+			p := key.(string)
+			if strings.HasSuffix(p, "/") {
+				// Match if path starts with route prefix, or path is the prefix minus trailing slash
+				if strings.HasPrefix(path, p) || path+"/" == p {
+					if len(p) > len(matchedPath) {
+						matchedPath = p
+						handler = value.(http.Handler)
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	if handler != nil {
+		handler.ServeHTTP(w, r)
+	} else {
+		http.NotFound(w, r)
+	}
 }
 
 func singleJoiningSlash(a, b string) string {
@@ -476,9 +507,7 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 	}
 
 	// Update server address with actual address
-	lm.muxLock.Lock()
 	lm.server.Addr = ln.Addr().String()
-	lm.muxLock.Unlock()
 
 	lm.logger.Printf("Server started on %s", lm.GetServerAddr())
 
