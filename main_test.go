@@ -1045,6 +1045,69 @@ func TestHealthRouteRegistration(t *testing.T) {
 	cancel()
 }
 
+func TestProxyErrorHandler(t *testing.T) {
+	// Create a temporary config file that points to a non-existent backend
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(configFile.Name())
+
+	// Point to a port that's not listening
+	config := `
+routes:
+  /test:
+    target: http://127.0.0.1:19999
+`
+	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	opts := &Options{
+		HTTPAddr:  "127.0.0.1:0",
+		LogErrors: true,
+	}
+
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := lm.Run(ctx, configFile.Name()); err != nil && err != context.Canceled {
+			t.Errorf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for server to be ready
+	for i := 0; i < 50; i++ {
+		if addr := lm.GetServerAddr(); addr != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	serverAddr := lm.GetServerAddr()
+	if serverAddr == "" {
+		t.Fatal("Server address is empty")
+	}
+
+	// Make request - should trigger error handler
+	resp, err := http.Get(fmt.Sprintf("http://%s/test", serverAddr))
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// Should get bad gateway due to backend connection failure
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	cancel()
+}
+
 func TestRemoteReloaderErrors(t *testing.T) {
 	// Test with invalid URL
 	_, err := NewRemoteReloader("invalid-url", time.Second)
