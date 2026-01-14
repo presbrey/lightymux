@@ -363,18 +363,18 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 	// Log the config reload
 	lm.logger.Printf("Config file modified. Reloading...")
 
-	for path, route := range config.Routes {
+	for routeKey, route := range config.Routes {
 		target := route.Target
 		if target == "" {
-			return fmt.Errorf("route %s: no target specified", path)
+			return fmt.Errorf("route %s: no target specified", routeKey)
 		}
 
-		newKeys[path] = true
+		newKeys[routeKey] = true
 
 		if isWebScheme(target) {
 			nextHop, err := url.Parse(target)
 			if err != nil {
-				return fmt.Errorf("route %s: invalid URL %s: %v", path, target, err)
+				return fmt.Errorf("route %s: invalid URL %s: %v", routeKey, target, err)
 			}
 			proxy := lm.newReverseProxy(nextHop)
 
@@ -430,26 +430,27 @@ func (lm *LightyMux) applyConfig(config *LightyConfig) error {
 				}
 			}
 
-			lm.routes.Store(path, proxy)
-			lm.logger.Printf("Added proxy route: %s -> %s", path, target)
+			lm.routes.Store(routeKey, proxy)
+			lm.logger.Printf("Added proxy route: %s -> %s", routeKey, target)
 		} else {
 			// Check if target is a directory or a file
 			fileInfo, err := os.Stat(target)
 			if err != nil {
-				return fmt.Errorf("route %s: error accessing path %s: %v", path, target, err)
+				return fmt.Errorf("route %s: error accessing path %s: %v", routeKey, target, err)
 			}
 
 			if fileInfo.IsDir() {
 				// For directories, serve the entire directory
 				fs := http.FileServer(http.Dir(target))
-				lm.routes.Store(path, http.StripPrefix(path, fs))
-				lm.logger.Printf("Added directory route: %s -> %s", path, target)
+				_, path := parseRouteKey(routeKey)
+				lm.routes.Store(routeKey, http.StripPrefix(path, fs))
+				lm.logger.Printf("Added directory route: %s -> %s", routeKey, target)
 			} else {
 				// For single files, serve the file directly
-				lm.routes.Store(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				lm.routes.Store(routeKey, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					http.ServeFile(w, r, target)
 				}))
-				lm.logger.Printf("Added file route: %s -> %s", path, target)
+				lm.logger.Printf("Added file route: %s -> %s", routeKey, target)
 			}
 		}
 	}
