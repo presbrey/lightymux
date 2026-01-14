@@ -1,0 +1,48 @@
+# Server Configuration
+listen: 0.0.0.0      # Bind address (default: 0.0.0.0)
+port: 8080           # Port to listen on (default: 8080)
+health: /health      # Health check endpoint path
+
+# Logging Configuration
+log:
+  requests: true     # Log incoming HTTP requests
+  responses: false   # Log outgoing HTTP responses
+  errors: true       # Log proxy errors
+  verbose: false     # Enable verbose debug logging
+  file: ""           # Path to log file (empty = stdout)
+
+# Route Configuration
+routes:
+  # Simple reverse proxy
+  /api:
+    target: http://localhost:3000
+
+  # Static file serving (directory)
+  /static:
+    target: /var/www/static
+
+  # Static file serving (single file)
+  /robots.txt:
+    target: /var/www/robots.txt
+
+  # Hostname-based routing
+  api.example.com/v1/:
+    target: http://localhost:3001
+  
+  api.example.com/v2/:
+    target: http://localhost:3002
+
+  # Advanced route with header modification
+  /secure-api:
+    target: http://localhost:4000
+    rules:
+      - request:
+          headers:
+            header-add:
+              X-Proxy-Auth: "secret-token"
+            header-del:
+              - "X-Client-IP"
+      - response:
+          headers:
+            header-set:
+              Strict-Transport-Security: "max-age=31536000"

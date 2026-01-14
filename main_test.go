@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1407,5 +1408,63 @@ func TestParseArgs(t *testing.T) {
 			assert.Equal(t, tt.wantConfig, config)
 			assert.Equal(t, tt.wantOpts.HTTPAddr, opts.HTTPAddr)
 		})
+	}
+}
+
+func TestHTTPAddrOverride(t *testing.T) {
+	// Create a temporary config file
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(configFile.Name())
+
+	// Write config with explicit port
+	content := `
+listen: 0.0.0.0
+port: 9090
+routes: {}
+`
+	if err := os.WriteFile(configFile.Name(), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create LightyMux with HTTPAddr option set (should override config)
+	opts := &Options{
+		HTTPAddr: "127.0.0.1:0", // Random port, overrides 9090
+	}
+
+	lm, err := NewLightyMux(opts)
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := lm.Run(ctx, configFile.Name()); err != nil && err != context.Canceled {
+			t.Errorf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for server
+	var addr string
+	for i := 0; i < 50; i++ {
+		if addr = lm.GetServerAddr(); addr != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if addr == "" {
+		t.Fatal("Server failed to start")
+	}
+
+	// Verify the address is NOT 9090 (should be random port)
+	_, portStr, _ := net.SplitHostPort(addr)
+	if portStr == "9090" {
+		t.Errorf("Expected HTTP_ADDR override, got config port 9090")
 	}
 }

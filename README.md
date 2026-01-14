@@ -41,7 +41,7 @@ go build
 
 ### Environment Variables
 
-- `HTTP_ADDR`: HTTP listen address (default: ""), fallback if not in config file
+- `HTTP_ADDR`: HTTP listen address (default: ""), overrides config file `listen` and `port` settings
 - `READ_TIMEOUT`: Read timeout duration (default: 30s)
 - `WRITE_TIMEOUT`: Write timeout duration (default: 30s)
 - `IDLE_TIMEOUT`: Idle timeout duration (default: 60s)
@@ -49,7 +49,7 @@ go build
 
 ### Configuration File Format
 
-The configuration file uses YAML format with top-level server settings and routes:
+The configuration file uses YAML format with top-level server settings and routes. See [example.yml](example.yml) for a complete configuration example.
 
 ```yaml
 # Server settings

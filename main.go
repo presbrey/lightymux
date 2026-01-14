@@ -604,6 +604,11 @@ func (lm *LightyMux) Run(ctx context.Context, configFile string) error {
 
 // buildListenAddr builds the address to listen on from config and options
 func (lm *LightyMux) buildListenAddr() string {
+	// Environment variable/flag overrides config
+	if lm.options.HTTPAddr != "" {
+		return lm.options.HTTPAddr
+	}
+
 	// Use config values if available
 	if lm.config != nil {
 		listen := lm.config.Listen
@@ -615,8 +620,7 @@ func (lm *LightyMux) buildListenAddr() string {
 		return fmt.Sprintf("%s:%d", listen, lm.config.Port)
 	}
 
-	// Fall back to options.HTTPAddr
-	return lm.options.HTTPAddr
+	return ""
 }
 
 // parseConfig parses command line flags and environment variables into Options
