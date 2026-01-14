@@ -1550,3 +1550,59 @@ routes:
 		})
 	}
 }
+
+func TestHostBasedStaticFileServing(t *testing.T) {
+	// Create temporary static directory and file
+	staticDir, err := os.MkdirTemp("", "static")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(staticDir)
+
+	content := []byte("hello world")
+	if err := os.WriteFile(filepath.Join(staticDir, "test.txt"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create config file
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(configFile.Name())
+
+	// Configure host-based static route
+	config := fmt.Sprintf(`
+routes:
+  example.com/static/:
+    target: %s
+`, staticDir)
+
+	if err := os.WriteFile(configFile.Name(), []byte(config), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lm, err := NewLightyMux(&Options{HTTPAddr: ":0"})
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Manually load config
+	if err := lm.watchConfig(configFile.Name()); err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Request the file
+	req := httptest.NewRequest("GET", "http://example.com/static/test.txt", nil)
+	w := httptest.NewRecorder()
+
+	lm.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("ServeHTTP() status = %v, want %v", w.Code, http.StatusOK)
+	}
+
+	if body := w.Body.String(); body != string(content) {
+		t.Errorf("Body = %q, want %q", body, content)
+	}
+}
