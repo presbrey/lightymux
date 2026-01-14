@@ -106,7 +106,8 @@ func makeRouteKey(host, path string) string {
 	if host == "" {
 		return path
 	}
-	return host + path
+	// Host matching should be case-insensitive
+	return strings.ToLower(host) + path
 }
 
 // ConfigReloader is an interface for loading and watching configuration
@@ -478,8 +479,13 @@ func (lm *LightyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Find the best matching route
 	// Priority: host-specific exact > host-specific prefix > wildcard exact > wildcard prefix
+	// Priority: host-specific exact > host-specific prefix > wildcard exact > wildcard prefix
 	reqPath := r.URL.Path
 	reqHost := r.Host
+	if reqHost == "" {
+		reqHost = r.Header.Get("Host")
+	}
+
 	// Strip port from host if present
 	if idx := strings.LastIndex(reqHost, ":"); idx != -1 {
 		reqHost = reqHost[:idx]

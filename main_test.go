@@ -1468,3 +1468,85 @@ routes: {}
 		t.Errorf("Expected HTTP_ADDR override, got config port 9090")
 	}
 }
+
+func TestHostDetection(t *testing.T) {
+	// Create a temporary config file
+	configFile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(configFile.Name())
+
+	// Write config with mixed case host
+	content := `
+listen: 0.0.0.0
+port: 0
+routes:
+  example.com/:
+    target: http://backend.example.com
+`
+	if err := os.WriteFile(configFile.Name(), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lm, err := NewLightyMux(&Options{HTTPAddr: ":0"})
+	if err != nil {
+		t.Fatalf("Failed to create LightyMux: %v", err)
+	}
+
+	// Manually load config
+	if err := lm.watchConfig(configFile.Name()); err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		reqHost    string // r.Host
+		headerHost string // Host header
+		wantStatus int
+	}{
+		{
+			name:       "Standard lower case",
+			reqHost:    "example.com",
+			wantStatus: http.StatusBadGateway, // Should match and try to proxy (failing)
+		},
+		{
+			name:       "Mixed case request",
+			reqHost:    "Example.COM",
+			wantStatus: http.StatusBadGateway, // Should match due to case insensitivity
+		},
+		{
+			name:       "Host header fallback",
+			reqHost:    "",
+			headerHost: "example.com",
+			wantStatus: http.StatusBadGateway, // Should match using header
+		},
+		{
+			name:       "No host match",
+			reqHost:    "other.com",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.Host = tt.reqHost
+			if tt.headerHost != "" {
+				req.Header.Set("Host", tt.headerHost)
+			} else {
+				// httptest sets Host header from URL by default, clear it if we want to test empty
+				if tt.reqHost == "" {
+					req.Header.Del("Host")
+				}
+			}
+
+			w := httptest.NewRecorder()
+			lm.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("ServeHTTP() status = %v, want %v", w.Code, tt.wantStatus)
+			}
+		})
+	}
+}
